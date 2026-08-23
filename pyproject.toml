@@ -1,0 +1,80 @@
+[project]
+name = "rag-chatbot"
+version = "1.0.0"
+description = "Production-grade Retrieval-Augmented Generation chatbot powered by Azure OpenAI"
+readme = "README.md"
+requires-python = ">=3.13"
+
+dependencies = [
+    # Web framework
+    "fastapi",
+    "uvicorn[standard]",
+    "python-dotenv",
+    "pydantic>=2.11",
+    "pydantic-settings",
+    "python-multipart",
+
+    # Azure OpenAI
+    "openai",
+
+    # RAG / Vector Store
+    "langchain",
+    "langchain-text-splitters",
+    "langchain-openai",
+    # Upper bound required by ragas: ragas 0.4.3 imports
+    # `langchain_community.chat_models.vertexai`, which was removed in
+    # langchain-community 0.4.0, and ragas declares no upper bound itself.
+    # Without this, `import ragas` raises ModuleNotFoundError and every
+    # evaluation path silently degrades. This pins the whole langchain
+    # stack to 0.3.x; revisit once ragas supports langchain-community >=0.4.
+    "langchain-community<0.4",
+    "langchain-experimental",
+    "faiss-cpu",
+    "tiktoken",
+
+    # Document Loaders
+    "pypdf",
+    "python-docx",
+    # Required by langchain's Docx2txtLoader, which document_loader.py falls
+    # back to when multimodal preprocessing raises. Without it that fallback
+    # itself raises ModuleNotFoundError, turning a recoverable preprocessing
+    # error into a failed upload.
+    "docx2txt",
+
+    # Multimodal – PDF image/table extraction
+    "PyMuPDF",
+
+    # Security
+    "itsdangerous",
+
+    # Logging & Monitoring
+    "structlog",
+    "langfuse",
+
+    # RAG Evaluation
+    "ragas",
+    "litellm",
+
+    # Rate Limiting
+    # `limits` directly rather than slowapi: slowapi's middleware exempts any
+    # request whose route handler it cannot resolve, and current FastAPI hides
+    # included routes behind _IncludedRouter, so it silently limited nothing.
+    # See app/api/rate_limit.py.
+    "limits",
+
+    # Templating
+    "jinja2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+]
+
+# No [build-system]: this is an application, not a distributable package.
+# uv treats it as a virtual project — dependencies are installed into .venv
+# but the `app` package itself is imported from the working directory.
+[tool.uv]
+package = false

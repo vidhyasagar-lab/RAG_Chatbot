@@ -1,0 +1,227 @@
+"""Regression tests for the security findings fixed in the audit.
+
+Each test names the finding it guards so a future change that reopens one
+fails loudly rather than silently.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+# ── SEC-2: the passwordless login endpoint is gone ───────────────────────
+
+def test_passwordless_login_endpoint_removed(client):
+    """It returned any existing user's id and role for a bare username."""
+    resp = client.post("/api/v1/users/login", json={"username": "anyone"})
+    assert resp.status_code == 404, (
+        "POST /api/v1/users/login is reachable again - it authenticated "
+        "with no password and leaked user ids"
+    )
+
+
+def test_users_router_not_registered(client):
+    schema = client.get("/openapi.json").json()
+    assert not [p for p in schema["paths"] if p.startswith("/api/v1/users")]
+
+
+# ── SEC-4: endpoints that were unauthenticated ───────────────────────────
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("get", "/api/v1/documents/stats"),
+        ("get", "/api/v1/chat/scores/some-trace-id"),
+        ("post", "/api/v1/feedback/"),
+    ],
+)
+def test_endpoints_require_authentication(client, method, path):
+    kwargs = {"json": {"trace_id": "t", "score": 1}} if method == "post" else {}
+    resp = getattr(client, method)(path, **kwargs)
+    assert resp.status_code == 401, f"{path} answered {resp.status_code} unauthenticated"
+
+
+# ── SEC-1: rate limiting is actually enforced ────────────────────────────
+
+def test_rate_limit_middleware_is_registered(client):
+    from app.api.rate_limit import RateLimitMiddleware
+    from app.main import app
+
+    registered = [m.cls for m in app.user_middleware]
+    assert RateLimitMiddleware in registered, "no rate limiting in the stack"
+
+
+def _limited_client(limit="5/minute"):
+    """A minimal app carrying only the rate limiter, for isolated testing."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.api.rate_limit import RateLimitMiddleware
+
+    tiny = FastAPI()
+
+    @tiny.get("/thing")
+    def thing():
+        return {"ok": True}
+
+    @tiny.get("/api/v1/health")
+    def health():
+        return {"status": "healthy"}
+
+    tiny.add_middleware(RateLimitMiddleware, limit=limit, enabled=True)
+    return TestClient(tiny)
+
+
+def test_rate_limit_returns_429_when_exceeded():
+    """Requests past the budget must be rejected.
+
+    Guards the original bug *and* its subtler second half: slowapi exempts any
+    request whose route handler it cannot resolve, and current FastAPI hides
+    included routes behind ``_IncludedRouter`` — so simply registering
+    SlowAPIMiddleware limited nothing at all. This asserts observed behaviour,
+    never mere registration.
+    """
+    c = _limited_client("5/minute")
+    statuses = [c.get("/thing").status_code for _ in range(8)]
+    assert statuses[:5] == [200] * 5, f"limit kicked in too early: {statuses}"
+    assert 429 in statuses[5:], f"no 429 after exceeding 5/minute: {statuses}"
+
+
+def test_rate_limited_response_carries_retry_after():
+    c = _limited_client("2/minute")
+    for _ in range(3):
+        resp = c.get("/thing")
+    assert resp.status_code == 429
+    assert "Retry-After" in resp.headers
+
+
+def test_health_endpoint_is_exempt_from_rate_limiting():
+    """Liveness probes must not be throttled into looking unhealthy."""
+    c = _limited_client("3/minute")
+    statuses = {c.get("/api/v1/health").status_code for _ in range(10)}
+    assert statuses == {200}, f"health check got throttled: {statuses}"
+
+
+def test_rate_limit_can_be_disabled():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.api.rate_limit import RateLimitMiddleware
+
+    tiny = FastAPI()
+
+    @tiny.get("/thing")
+    def thing():
+        return {"ok": True}
+
+    tiny.add_middleware(RateLimitMiddleware, limit="2/minute", enabled=False)
+    c = TestClient(tiny)
+    assert {c.get("/thing").status_code for _ in range(6)} == {200}
+
+
+def test_forwarded_header_cannot_reset_the_budget():
+    """X-Forwarded-For is client-controlled; honouring it would defeat the limit."""
+    c = _limited_client("3/minute")
+    statuses = []
+    for i in range(8):
+        statuses.append(
+            c.get("/thing", headers={"X-Forwarded-For": f"10.0.0.{i}"}).status_code
+        )
+    assert 429 in statuses, f"spoofed forwarding header reset the budget: {statuses}"
+
+
+# ── HYG-2 / HYG-3: API-key public path list ──────────────────────────────
+
+def test_register_is_public_alongside_login():
+    from app.api.middleware import _PUBLIC_PATHS
+
+    assert "/register" in _PUBLIC_PATHS, (
+        "enabling API_KEY would break signup while login kept working"
+    )
+
+
+def test_api_docs_are_not_public():
+    from app.api.middleware import _PUBLIC_PATHS
+
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert path not in _PUBLIC_PATHS, (
+            f"{path} bypasses the API key, publishing the full API surface"
+        )
+
+
+# ── HYG-5: password comparison is constant time ──────────────────────────
+
+def test_password_verification_is_constant_time():
+    import inspect
+
+    from app.core import user_store
+
+    src = inspect.getsource(user_store._verify_password)
+    assert "compare_digest" in src, "digest compared with == leaks timing"
+
+
+def test_password_roundtrip_and_rejection():
+    from app.core.user_store import _hash_password, _verify_password
+
+    stored = _hash_password("correct-horse-battery")
+    assert _verify_password("correct-horse-battery", stored) is True
+    assert _verify_password("wrong-password", stored) is False
+    assert _verify_password("anything", "") is False
+    assert _verify_password("anything", "not:hex") is False
+
+
+# ── HYG-6: the shipped default secret is rejected in production ──────────
+
+def test_default_secret_key_refused_outside_development():
+    from app.config import DEFAULT_SECRET_KEY
+
+    assert DEFAULT_SECRET_KEY == "change-me-to-a-random-secret"
+    # The guard lives in the lifespan handler; assert it references the constant.
+    import inspect
+
+    import app.main as main_mod
+
+    src = inspect.getsource(main_mod.lifespan)
+    assert "_DEFAULT_SECRET_KEY" in src and "RuntimeError" in src
+
+
+# ── DEAD-1: the legacy standalone UI is gone ─────────────────────────────
+
+def test_legacy_static_ui_removed():
+    from pathlib import Path
+
+    import app.main as main_mod
+
+    static_dir = Path(main_mod.__file__).resolve().parent.parent / "static"
+    assert not (static_dir / "index.html").exists(), (
+        "static/index.html is back: it bypassed the API-key gate and "
+        "authenticated through the removed passwordless endpoint"
+    )
+
+
+# ── SEC-3: model output is sanitised before innerHTML ────────────────────
+
+def test_markdown_output_is_sanitised():
+    from pathlib import Path
+
+    import app.main as main_mod
+
+    root = Path(main_mod.__file__).resolve().parent.parent
+    app_html = (root / "templates" / "app.html").read_text(encoding="utf-8")
+    base_html = (root / "templates" / "base.html").read_text(encoding="utf-8")
+
+    assert "DOMPurify.sanitize" in app_html, "marked output reaches innerHTML unsanitised"
+    assert "dompurify" in base_html.lower(), "DOMPurify script not loaded"
+
+
+def test_cdn_scripts_are_version_pinned():
+    """An unpinned tag silently follows upstream major versions."""
+    import re
+    from pathlib import Path
+
+    import app.main as main_mod
+
+    base = (Path(main_mod.__file__).resolve().parent.parent / "templates" / "base.html")
+    html = base.read_text(encoding="utf-8")
+    for src in re.findall(r'<script src="(https://(?:cdn\.jsdelivr\.net|unpkg\.com)[^"]+)"', html):
+        assert "@" in src.split("/npm/")[-1] or "@" in src, f"unpinned dependency: {src}"

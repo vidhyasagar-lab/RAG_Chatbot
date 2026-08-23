@@ -1,0 +1,33 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime data — the whole directory. users.db lives here and holds
+# password hashes, so ignoring only data/vectorstore/ was not enough.
+data/
+
+# User uploads and extracted images
+uploads/*
+!uploads/.gitkeep
+
+# Misc
+*.log
+.DS_Store
+Thumbs.db
