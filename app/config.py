@@ -4,10 +4,27 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
-#: Shipped placeholder. Startup refuses to run with this outside development.
-DEFAULT_SECRET_KEY = "change-me-to-a-random-secret"
+#: Minimum accepted length for SECRET_KEY. `secrets.token_urlsafe(32)` yields 43.
+MIN_SECRET_KEY_LENGTH = 16
+
+#: Values that are *rejected*, never used as fallbacks. There is deliberately no
+#: default SECRET_KEY: a signing key baked into source is a signing key every
+#: reader of the repository knows, which makes session cookies forgeable. The
+#: real value belongs in .env and nowhere else.
+PLACEHOLDER_SECRETS = frozenset(
+    {
+        "change-me-to-a-random-secret",
+        "changeme",
+        "change-me",
+        "secret",
+        "supersecret",
+        "your-secret-key",
+        "test",
+    }
+)
 
 
 class Settings(BaseSettings):
@@ -47,8 +64,33 @@ class Settings(BaseSettings):
     # and /static/. Set rate_limit_enabled=false to disable entirely.
     rate_limit: str = "60/minute"
     rate_limit_enabled: bool = True
-    # Refused at startup outside development — see app/main.py lifespan.
-    secret_key: str = DEFAULT_SECRET_KEY  # HMAC signing for session cookies
+    # HMAC signing for session cookies. Required — must come from .env, with no
+    # in-source default. Validated below.
+    secret_key: str
+
+    @field_validator("secret_key")
+    @classmethod
+    def _reject_weak_secret_key(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError(
+                "SECRET_KEY is empty. Set it in .env — generate one with:\n"
+                '  python -c "import secrets; print(secrets.token_urlsafe(32))"'
+            )
+        if stripped.lower() in PLACEHOLDER_SECRETS:
+            raise ValueError(
+                f"SECRET_KEY is still the placeholder {stripped!r}. Session cookies "
+                "signed with a publicly known key are trivially forgeable. Set a real "
+                "value in .env — generate one with:\n"
+                '  python -c "import secrets; print(secrets.token_urlsafe(32))"'
+            )
+        if len(stripped) < MIN_SECRET_KEY_LENGTH:
+            raise ValueError(
+                f"SECRET_KEY is {len(stripped)} characters; at least "
+                f"{MIN_SECRET_KEY_LENGTH} are required. Generate one with:\n"
+                '  python -c "import secrets; print(secrets.token_urlsafe(32))"'
+            )
+        return v
 
     # RAG – Hybrid Chunking (token-based)
     parent_chunk_tokens: int = 512

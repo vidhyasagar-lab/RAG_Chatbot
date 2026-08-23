@@ -22,6 +22,7 @@ Production-grade **Multimodal Retrieval-Augmented Generation** chatbot powered b
 - [API Reference](#api-reference)
 - [Frontend](#frontend)
 - [Security](#security)
+- [Testing](#testing)
 - [Docker Deployment](#docker-deployment)
 - [Project Structure](#project-structure)
 
@@ -69,9 +70,9 @@ Production-grade **Multimodal Retrieval-Augmented Generation** chatbot powered b
 │ │• API Key │ │• /chat       │ │• /       │ │• CSS/JS  │         │
 │ │• Logging │ │• /documents  │ │• /login  │ │          │         │
 │ │• Security│ │• /feedback   │ │• /admin  │ │          │         │
-│ │  Headers │ │• /users      │ │• /logout │ │          │         │
-│ │• CORS   │ │• /admin      │ │• partials│ │          │         │
-│ │• Rate   │ │• /health     │ │          │ │          │         │
+│ │  Headers │ │• /admin      │ │• /logout │ │          │         │
+│ │• CORS   │ │• /health     │ │• partials│ │          │         │
+│ │• Rate   │ │              │ │          │ │          │         │
 │ │  Limit  │ │              │ │          │ │          │         │
 │ └─────────┘ └──────┬───────┘ └──────────┘ └──────────┘         │
 │                    │                                             │
@@ -89,12 +90,13 @@ Production-grade **Multimodal Retrieval-Augmented Generation** chatbot powered b
 │ │ ┌─────▼─────────────▼─────────────────────▼──────────┐ │      │
 │ │ │              Vector Store (Hybrid)                  │ │      │
 │ │ │  Dense: FAISS  │  Sparse: BM25  │  RRF Fusion      │ │      │
-│ │ │  Parent Cache  │  Image Cache   │  User Isolation   │ │      │
+│ │ │  Parent Store  │  Image Store   │  User Isolation   │ │      │
+│ │  persisted: index + rag_documents_state.pkl sidecar │ │      │
 │ │ └────────────────────────────────────────────────────┘ │      │
 │ └────────────────────────────────────────────────────────┘      │
 │                                                                  │
 │ ┌──────────────────────────────────────────────────────────┐    │
-│ │                  SQLite (users.db)                        │    │
+│ │               SQLite (data/users.db, WAL)                 │    │
 │ │  users │ user_documents │ chat_sessions │ chat_messages   │    │
 │ │  golden_dataset │ eval_runs │ eval_results │ query_scores │    │
 │ │  eval_cache                                               │    │
@@ -124,7 +126,7 @@ Production-grade **Multimodal Retrieval-Augmented Generation** chatbot powered b
 | **Observability** | Langfuse (tracing, scores, cost tracking) |
 | **Database** | SQLite (WAL mode) — users, documents, chat sessions, eval results, eval cache |
 | **Document Processing** | PyPDF, PyMuPDF, python-docx, docx2txt, tiktoken |
-| **Frontend** | Jinja2 templates, HTMX 2.0, Tailwind CSS (CDN), marked.js (Markdown rendering) |
+| **Frontend** | Jinja2 templates, HTMX 2.0.4, Tailwind CSS (Play CDN), marked.js 15.0.12, DOMPurify 3.4.14 |
 | **Auth** | itsdangerous (HMAC-signed cookies), PBKDF2-SHA256 passwords |
 | **Rate Limiting** | `limits` (60 req/min per IP, configurable) |
 | **Logging** | structlog (structured JSON logs) |
@@ -231,6 +233,10 @@ LOG_LEVEL=INFO
 API_KEY=                              # Optional: require X-API-Key header on all requests
 SECRET_KEY=change-me-to-a-random-secret  # HMAC signing for session cookies
 
+# ── Rate Limiting ────────────────────────────────────
+RATE_LIMIT=60/minute                  # Per-IP budget; /api/v1/health and /static/ exempt
+RATE_LIMIT_ENABLED=true
+
 # ── RAG — Hybrid Chunking (token-based) ──────────────
 PARENT_CHUNK_TOKENS=512
 PARENT_OVERLAP_TOKENS=50
@@ -267,9 +273,39 @@ LANGFUSE_HOST=https://cloud.langfuse.com
 CORS_ORIGINS=http://localhost:3000,http://localhost:8000
 
 # ── Paths ────────────────────────────────────────────
-VECTORSTORE_DIR=data/vectorstore
+DATA_DIR=data                         # Relational stores (users.db)
+VECTORSTORE_DIR=data/vectorstore      # FAISS index + retrieval-state sidecar
 UPLOAD_DIR=uploads
 ```
+
+### Secrets
+
+**Every secret lives in `.env` and nowhere else.** No credential has a usable
+default in `config.py` or any other source file — an in-source signing key is a
+key that every reader of the repository knows.
+
+| Setting | Source |
+|---|---|
+| `AZURE_OPENAI_API_KEY` | `.env` — required, no default |
+| `AZURE_OPENAI_ENDPOINT` | `.env` — required, no default |
+| `SECRET_KEY` | `.env` — required, no default, validated (see below) |
+| `AZURE_OPENAI_EMBEDDING_API_KEY` | `.env` — optional, defaults to empty (falls back to the main key) |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | `.env` — optional, default empty (tracing disables itself) |
+| `API_KEY` | `.env` — optional, default empty (header check disabled) |
+
+`SECRET_KEY` is validated when settings are constructed, so a bad value fails
+before the server can accept a single request. Rejected: **missing**, **empty**,
+**shorter than 16 characters**, and the shipped placeholder in `.env.example`
+(case-insensitive). There is no development exemption — signing session cookies
+with a publicly known key is forgeable in dev too. Generate one with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+`.env` is git-ignored and excluded from the Docker build context, so secrets
+reach the container only at runtime via `env_file:` — never baked into an image
+layer.
 
 ### Configuration Reference
 
@@ -282,7 +318,11 @@ UPLOAD_DIR=uploads
 | `AZURE_OPENAI_EMBEDDING_MODEL` | `text-embedding-ada-002` | Embedding deployment name |
 | `AZURE_OPENAI_EMBEDDING_API_KEY` | *(falls back to main key)* | Separate key for embeddings |
 | `AZURE_OPENAI_EMBEDDING_ENDPOINT` | *(falls back to main endpoint)* | Separate endpoint for embeddings |
+| `AZURE_OPENAI_EMBEDDING_API_VERSION` | *(falls back to main version)* | Separate API version for embeddings |
 | `APP_ENV` | `production` | Environment (`production` or `development`) |
+| `APP_HOST` | `0.0.0.0` | Bind address |
+| `APP_PORT` | `8000` | Bind port |
+| `LOG_LEVEL` | `INFO` | structlog level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `API_KEY` | *(empty = disabled)* | Optional global API key via `X-API-Key` header |
 | `PARENT_CHUNK_TOKENS` | `512` | Max tokens per parent chunk |
 | `CHILD_CHUNK_TOKENS` | `128` | Max tokens per child chunk |
@@ -297,10 +337,10 @@ UPLOAD_DIR=uploads
 | `VISION_DETAIL` | `high` | Vision API detail level (`low`, `high`, `auto`) |
 | `VISION_MAX_TOKENS` | `1024` | Max tokens for vision API responses |
 | `VISION_MAX_CONCURRENCY` | `6` | Image descriptions run in parallel during ingest. Raise to speed up image-heavy documents; lower if you hit Azure rate limits |
-| `SECRET_KEY` | - | **Required.** Signs session cookies; startup refuses the shipped default outside development |
+| `SECRET_KEY` | *(required)* | Signs session cookies. No in-source default; empty, placeholder, or <16-char values are rejected at startup |
 | `RATE_LIMIT` | `60/minute` | Per-IP request budget (health and static are exempt) |
 | `RATE_LIMIT_ENABLED` | `true` | Set false to disable rate limiting |
-| `DATA_DIR` | `data` | Relational stores (users, chats, evals) |
+| `DATA_DIR` | `data` | Relational store (`users.db` — users, chats, evals). Moved here from `VECTORSTORE_DIR`; an existing DB is migrated automatically on first start |
 | `EVAL_GATING_ENABLED` | `true` | Enable eval-gated answer pipeline |
 | `EVAL_QUALITY_THRESHOLD` | `0.5` | Minimum faithfulness to accept an answer |
 | `EVAL_MAX_RETRIES` | `1` | Regeneration attempts when faithfulness is too low |
@@ -309,7 +349,7 @@ UPLOAD_DIR=uploads
 | `LANGFUSE_SECRET_KEY` | *(empty)* | Langfuse secret key |
 | `LANGFUSE_HOST` | `https://cloud.langfuse.com` | Langfuse server URL |
 | `CORS_ORIGINS` | `http://localhost:3000,http://localhost:8000` | Comma-separated allowed origins |
-| `VECTORSTORE_DIR` | `data/vectorstore` | Path to persist FAISS index and SQLite DBs |
+| `VECTORSTORE_DIR` | `data/vectorstore` | FAISS index plus the `rag_documents_state.pkl` retrieval sidecar |
 | `UPLOAD_DIR` | `uploads` | Path for uploaded documents |
 
 ---
@@ -455,11 +495,24 @@ Evaluation scores are cached in SQLite keyed by a SHA-256 hash of `question + so
 | **Settings** | `@lru_cache` (singleton) | Environment config loaded once |
 | **Embeddings client** | `@lru_cache` (singleton) | AzureOpenAIEmbeddings instance |
 | **FAISS store** | Thread-safe singleton | Vector index loaded/created once |
-| **BM25 index** | In-memory singleton | Keyword index rebuilt on add/delete |
-| **Parent chunk store** | In-memory `dict[str, Document]` | Maps `chunk_id` → parent document |
-| **Image metadata store** | In-memory `dict[str, list[dict]]` | Maps source → image records |
+| **BM25 index** | In-memory singleton, **persisted** | Keyword index rebuilt on add/delete, written to the sidecar |
+| **Parent chunk store** | In-memory `dict[str, Document]`, **persisted** | Maps `chunk_id` → parent document |
+| **Image metadata store** | In-memory `dict[str, list[dict]]`, **persisted** | Maps source → image records |
 | **Langfuse client** | Lazy singleton | Initialised on first use |
 | **tiktoken encoder** | Module-level singleton | `cl100k_base` encoder |
+
+### Retrieval-State Persistence
+
+The BM25 corpus, parent-chunk map and image records are written to
+`data/vectorstore/rag_documents_state.pkl` (atomic temp-file + rename) on every
+index mutation, alongside the FAISS files. Previously only FAISS was saved, so
+each restart silently dropped hybrid retrieval to dense-only and lost parent
+expansion — with no error to signal it.
+
+An index created before the sidecar existed rebuilds its BM25 corpus from the
+FAISS docstore on first load. Parent chunks cannot be recovered this way — they
+were never written anywhere — so re-upload affected documents to restore
+parent-context expansion.
 
 ---
 
@@ -483,7 +536,7 @@ All API endpoints are prefixed with `/api/v1`. Page routes are served at the roo
 | `GET` | `/api/v1/chat/sessions/{id}` | Cookie | Get all messages for a chat session |
 | `PATCH` | `/api/v1/chat/sessions/{id}` | Cookie | Rename a chat session |
 | `DELETE` | `/api/v1/chat/sessions/{id}` | Cookie | Delete a session and all its messages |
-| `GET` | `/api/v1/chat/scores/{trace_id}` | None | Poll RAGAS quality scores (204 if not ready) |
+| `GET` | `/api/v1/chat/scores/{trace_id}` | Cookie | Poll RAGAS quality scores (204 if not ready). Scores are scoped to the trace's owner |
 
 ### Documents
 
@@ -492,19 +545,20 @@ All API endpoints are prefixed with `/api/v1`. Page routes are served at the roo
 | `POST` | `/api/v1/documents/upload` | Cookie | Upload, chunk, and index a document (multipart) |
 | `GET` | `/api/v1/documents/history` | Cookie | List documents uploaded by authenticated user |
 | `DELETE` | `/api/v1/documents/{doc_id}` | Cookie | Delete a document and all its chunks |
-| `GET` | `/api/v1/documents/stats` | None | Vector store collection stats |
+| `GET` | `/api/v1/documents/stats` | Cookie | Vector store collection stats |
 
 ### Feedback
 
 | Method | Endpoint | Auth | Description |
 |---|---|---|---|
-| `POST` | `/api/v1/feedback/` | None | Submit thumbs up/down feedback (pushed to Langfuse) |
+| `POST` | `/api/v1/feedback/` | Cookie | Submit thumbs up/down feedback (pushed to Langfuse). Rejects traces the caller does not own |
 
 ### Users
 
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| `POST` | `/api/v1/users/login` | None | Login or auto-create user by username |
+Authentication is handled by the server-rendered `/login` and `/register` form
+routes below. There is no JSON user API: the former `POST /api/v1/users/login`
+authenticated on a username alone — no password — and returned the account's
+real `user_id` and role, so it was removed along with the legacy UI that used it.
 
 ### Admin (requires admin role)
 
@@ -560,13 +614,30 @@ The UI is server-rendered with **Jinja2 templates** and uses **HTMX** for dynami
 - Page loader with spinner animation
 - Responsive layout
 
+### Markdown Rendering
+
+Model output is Markdown-rendered with `marked` and then passed through
+**DOMPurify** before it reaches `innerHTML`. If DOMPurify fails to load, the
+renderer falls back to HTML-escaped plain text rather than rendering unsanitised
+markup.
+
+### CDN dependencies
+
+`htmx`, `marked` and `dompurify` are loaded from pinned, versioned CDN URLs, so
+an upstream release cannot change the shipped behaviour. **Tailwind is the
+exception**: the Play CDN serves only `https://cdn.tailwindcss.com` and returns
+403 for versioned paths, so it cannot be pinned. Its runtime compiler is also why
+the CSP still needs `unsafe-inline`. Removing both means replacing the Play CDN
+with a compiled Tailwind stylesheet — a build step this project deliberately does
+not have yet.
+
 ---
 
 ## Security
 
 | Feature | Implementation |
 |---|---|
-| **Password Hashing** | PBKDF2-SHA256 with 260,000 iterations and random 16-byte salt |
+| **Password Hashing** | PBKDF2-SHA256 with 260,000 iterations, random 16-byte salt, timing-safe verification (`hmac.compare_digest`) |
 | **Session Cookies** | HMAC-signed via `itsdangerous.URLSafeTimedSerializer`, HttpOnly, Secure (in production), SameSite=Lax, 7-day expiry |
 | **Brute-Force Protection** | 5 failed attempts → 5-minute lockout per username |
 | **API Key Auth** | Optional `X-API-Key` header with constant-time comparison (`hmac.compare_digest`) |
@@ -574,9 +645,42 @@ The UI is server-rendered with **Jinja2 templates** and uses **HTMX** for dynami
 | **Security Headers** | `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection`, `Referrer-Policy`, `Permissions-Policy`, Content Security Policy |
 | **File Upload Validation** | Extension allowlist, 50 MB size limit, magic bytes verification, path traversal prevention |
 | **User Isolation** | Documents and retrieval results are scoped to the authenticated user's `user_id` |
+| **Ownership Checks** | Chat sessions, quality scores and feedback verify the trace/session belongs to the caller, not just that the caller is logged in |
+| **Rate Limiting** | Enforced as ASGI middleware (`app/api/rate_limit.py`) on every request, keyed on the direct peer address. `X-Forwarded-For` is deliberately **not** trusted — behind a proxy, terminate rate limiting there |
+| **Output Sanitisation** | Model-generated Markdown is sanitised with DOMPurify before insertion into the DOM |
+| **Secret Management** | All credentials come from `.env`; no secret has a usable default in source. `.env` is excluded from both git and the Docker build context |
+| **Secret Key Guard** | `SECRET_KEY` is validated at settings construction — missing, empty, placeholder, or under 16 characters aborts startup, with no development exemption |
 | **Error Handling** | Global exception handler prevents stack trace leakage |
 | **Non-Root Container** | Docker runs as `appuser` (non-root) |
 | **Input Validation** | Pydantic schemas with field constraints (min/max length, regex patterns, value ranges) |
+
+---
+
+## Testing
+
+```bash
+uv run python -m pytest          # 41 tests
+uv run python -m pytest -v       # verbose
+```
+
+Tests run entirely against fakes — a stub embedding class and dummy Azure
+credentials — so **no test consumes Azure quota or reaches the network**. Each
+run gets its own temporary `DATA_DIR`, `VECTORSTORE_DIR` and `UPLOAD_DIR`, so
+your real `data/` is never touched.
+
+| File | Covers |
+|---|---|
+| `test_smoke.py` | App construction, health endpoint, page routes, HTMX partials, security headers |
+| `test_security.py` | Rate limiting actually returns 429, auth gates on protected endpoints, cross-user ownership rejection |
+| `test_auth_flow.py` | Registration, login, logout, password length rules, brute-force lockout, cookie attributes |
+| `test_retrieval_state.py` | BM25 and parent chunks survive a simulated restart; legacy indexes rebuild from the FAISS docstore |
+
+The rate-limit tests assert an **observed 429**, not that the middleware is
+registered. This matters: the previous slowapi setup was registered correctly and
+still enforced nothing, because slowapi exempts any request whose route handler
+it cannot resolve and current FastAPI hides included routes behind
+`_IncludedRouter`. A registration-only assertion would have passed against a
+completely inert limiter.
 
 ---
 
@@ -591,12 +695,11 @@ docker compose up --build -d
 ### Details
 
 - **Port**: `8000:8000`
-- **Env file**: `.env` loaded automatically
-- **Volumes**: `data/vectorstore` and `uploads` are persisted to host
-- **Health check**: Polls `/api/v1/health` every 30s
+- **Env file**: `.env` supplied at **runtime** via `env_file:`. It is excluded from the build context by `.dockerignore`, so secrets are never written into an image layer — the Dockerfile's `COPY . .` would otherwise bake `.env`, `data/users.db` and the host `.venv` into the image permanently, where `docker history` can read them back
+- **Volumes**: the whole `data/` directory (index **and** `users.db`) plus `uploads` are persisted to host
 - **Restart policy**: `unless-stopped`
 - **Base image**: `python:3.13-slim` with uv and a non-root `appuser`
-- **Health check**: probes `/api/v1/health` with the Python interpreter (the slim image has no `curl`)
+- **Health check**: probes `/api/v1/health` every 30s using the Python interpreter — the slim image has no `curl`, so the original `curl`-based check reported the container unhealthy no matter what the app did
 - **Workers**: 1 Uvicorn worker. The FAISS index, BM25 index, parent-chunk map and login counters are per-process state, so additional workers would each hold a divergent copy. Scaling out requires moving that state to a shared store first.
 
 ---
@@ -609,9 +712,12 @@ docker compose up --build -d
 ├── pyproject.toml              # Project metadata + dependencies
 ├── uv.lock                     # Fully pinned, reproducible dependency lock
 ├── .python-version             # Pinned interpreter (3.13.12)
+├── pytest.ini                  # Test configuration
 ├── Dockerfile                  # Container image definition
+├── .dockerignore               # Keeps .env, data/ and .venv/ out of the build context
 ├── docker-compose.yml          # Docker Compose orchestration
-├── .env                        # Environment variables (create manually)
+├── .env                        # Secrets and settings (git-ignored; create manually)
+├── .env.example                # Template — copy to .env and fill in
 │
 ├── app/
 │   ├── __init__.py
@@ -620,12 +726,12 @@ docker compose up --build -d
 │   │
 │   ├── api/
 │   │   ├── middleware.py        # SecurityHeaders, RequestLogging, APIKey, global exception handler
+│   │   ├── rate_limit.py        # Per-IP rate-limit middleware (replaces slowapi)
 │   │   └── routes/
 │   │       ├── health.py        # GET /api/v1/health
 │   │       ├── chat.py          # POST /chat, /chat/stream, session CRUD, score polling
 │   │       ├── documents.py     # POST /upload, GET /history, DELETE /{doc_id}, GET /stats
 │   │       ├── feedback.py      # POST /feedback (Langfuse score)
-│   │       ├── users.py         # POST /users/login
 │   │       ├── admin.py         # Admin: users, Langfuse, golden dataset, evaluation
 │   │       └── pages.py         # Server-rendered pages (login, app, admin, HTMX partials)
 │   │
@@ -640,6 +746,7 @@ docker compose up --build -d
 │   │   ├── eval_store.py        # SQLite: golden dataset, eval runs/results, query scores, eval cache
 │   │   ├── chat_store.py        # SQLite: chat sessions and messages
 │   │   ├── user_store.py        # SQLite: users, documents, admin ops, PBKDF2 passwords
+│   │   ├── db.py                # Shared SQLite helper: path resolution, migration, WAL, busy_timeout
 │   │   ├── auth.py              # Signed cookies, brute-force protection, FastAPI dependencies
 │   │   ├── observability.py     # Langfuse client singleton, trace/span/score helpers
 │   │   └── logging.py           # structlog configuration
@@ -656,13 +763,24 @@ docker compose up --build -d
 │       ├── stats.html           # Vector store stats fragment
 │       └── doc_history.html     # Document history list fragment
 │
-├── static/
+├── static/                      # Mounted at /static if present (currently empty)
 │
-├── data/vectorstore/            # Persisted FAISS index
-├── uploads/                     # User-uploaded documents (per-user subdirectories)
-│   └── extracted/               # Extracted images/tables from PDFs
-└── tests/                       # Test directory (empty — tests not yet implemented)
+├── tests/
+│   ├── conftest.py              # Temp dirs, fake embeddings, isolated settings — no Azure calls
+│   ├── test_smoke.py            # App boot, health, page routes, HTMX partials
+│   ├── test_security.py         # Rate limiting, auth gates, ownership checks, headers
+│   ├── test_auth_flow.py        # Register/login/logout, brute-force lockout, cookie attributes
+│   └── test_retrieval_state.py  # Sidecar persistence and BM25 survival across restart
+│
+├── data/                        # Git-ignored (holds password hashes)
+│   ├── users.db                 # SQLite: users, documents, chats, evals
+│   └── vectorstore/             # FAISS index + rag_documents_state.pkl sidecar
+└── uploads/                     # User-uploaded documents (per-user subdirectories)
+    └── extracted/               # Extracted images/tables from PDFs
 ```
+
+> `data/` and `.env` are ignored by git in their entirety. `data/users.db`
+> contains PBKDF2 password hashes and must never be committed.
 
 ---
 

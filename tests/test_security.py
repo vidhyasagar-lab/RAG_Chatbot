@@ -170,19 +170,73 @@ def test_password_roundtrip_and_rejection():
     assert _verify_password("anything", "not:hex") is False
 
 
-# ── HYG-6: the shipped default secret is rejected in production ──────────
+# ── HYG-6: secrets come from .env only, and weak ones are rejected ───────
 
-def test_default_secret_key_refused_outside_development():
-    from app.config import DEFAULT_SECRET_KEY
+def _settings_with(secret: str):
+    """Build Settings with an explicit secret_key, ignoring the ambient .env."""
+    from app.config import Settings
 
-    assert DEFAULT_SECRET_KEY == "change-me-to-a-random-secret"
-    # The guard lives in the lifespan handler; assert it references the constant.
-    import inspect
+    return Settings(
+        _env_file=None,
+        azure_openai_api_key="k",
+        azure_openai_endpoint="https://example.openai.azure.com",
+        secret_key=secret,
+    )
 
-    import app.main as main_mod
 
-    src = inspect.getsource(main_mod.lifespan)
-    assert "_DEFAULT_SECRET_KEY" in src and "RuntimeError" in src
+def test_config_has_no_hardcoded_secret_key_default(monkeypatch):
+    """secret_key must be required — an in-source default is a known signing key."""
+    import pydantic
+
+    from app.config import Settings
+
+    field = Settings.model_fields["secret_key"]
+    assert field.is_required(), "secret_key must not have a default in config.py"
+
+    # conftest exports SECRET_KEY for the rest of the suite; drop it here so the
+    # absence of an in-source default is what the assertion actually observes.
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    with pytest.raises(pydantic.ValidationError):
+        Settings(
+            _env_file=None,
+            azure_openai_api_key="k",
+            azure_openai_endpoint="https://example.openai.azure.com",
+        )
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["", "   ", "change-me-to-a-random-secret", "CHANGE-ME-TO-A-RANDOM-SECRET", "secret", "short"],
+)
+def test_weak_secret_keys_are_rejected(bad):
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        _settings_with(bad)
+
+
+def test_strong_secret_key_is_accepted():
+    import secrets
+
+    good = secrets.token_urlsafe(32)
+    assert _settings_with(good).secret_key == good
+
+
+def test_no_real_secret_values_live_outside_env():
+    """Secret-shaped settings must default to empty, never to a usable value."""
+    from app.config import Settings
+
+    for name in (
+        "api_key",
+        "langfuse_public_key",
+        "langfuse_secret_key",
+        "azure_openai_embedding_api_key",
+    ):
+        field = Settings.model_fields[name]
+        assert field.default == "", f"{name} must default to empty, not a real value"
+
+    for name in ("azure_openai_api_key", "azure_openai_endpoint", "secret_key"):
+        assert Settings.model_fields[name].is_required(), f"{name} must come from .env"
 
 
 # ── DEAD-1: the legacy standalone UI is gone ─────────────────────────────

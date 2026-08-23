@@ -13,7 +13,7 @@ from app.api.rate_limit import RateLimitMiddleware
 from app.api.routes import chat, documents, health, feedback
 from app.api.routes.admin import router as admin_router
 from app.api.routes.pages import router as pages_router
-from app.config import DEFAULT_SECRET_KEY as _DEFAULT_SECRET_KEY, get_settings
+from app.config import get_settings
 from app.core.logging import get_logger, setup_logging
 
 logger = get_logger(__name__)
@@ -25,16 +25,9 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     setup_logging(settings.log_level)
 
-    # Refuse to serve production traffic with the shipped placeholder secret —
-    # session cookies signed with a known key are trivially forgeable.
-    if settings.secret_key == _DEFAULT_SECRET_KEY:
-        if settings.app_env.lower() in ("development", "dev", "local"):
-            logger.warning("secret_key_is_default_dev_only")
-        else:
-            raise RuntimeError(
-                "SECRET_KEY is still the shipped default. Set SECRET_KEY in .env to a "
-                "random value (e.g. `python -c \"import secrets;print(secrets.token_urlsafe(32))\"`)."
-            )
+    # SECRET_KEY is validated in app.config: it is a required field with no
+    # in-source default, so a missing, placeholder, or too-short value fails
+    # when Settings is constructed — before any request can be served.
 
     # Eagerly initialise the vector store so first request isn't slow
     from app.core.vector_store import get_vector_store
