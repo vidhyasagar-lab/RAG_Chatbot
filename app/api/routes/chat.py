@@ -2,7 +2,9 @@
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException
 from fastapi.responses import Response, StreamingResponse
+from starlette.concurrency import iterate_in_threadpool
 
+from app.config import get_settings
 from app.core.auth import get_current_user_id, require_authenticated_user
 from app.core.chat_store import (
     add_message,
@@ -120,7 +122,12 @@ async def chat(request: ChatRequest, current_user: dict = Depends(require_authen
 
 @router.post("/stream")
 async def chat_stream(request: ChatRequest, current_user: dict = Depends(require_authenticated_user)) -> StreamingResponse:
-    """Stream a RAG-augmented answer via Server-Sent Events (eval-gated)."""
+    """Stream a RAG-augmented answer via Server-Sent Events.
+
+    With ``EVAL_GATING_ENABLED`` the answer is verified before any token is
+    sent (meta -> eval -> token -> done); without it tokens stream as they are
+    generated (meta -> token -> done) and scores arrive later via /scores.
+    """
     # Enforce authenticated user_id instead of trusting request body
     request.user_id = current_user["user_id"]
     session_id = _ensure_session(request, current_user["user_id"])
@@ -132,16 +139,23 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
     # Load history from DB
     history = _load_history(session_id)
 
+    pipeline_args = dict(
+        question=request.question,
+        chat_history=history[:-1],
+        top_k=request.top_k,
+        user_id=request.user_id,
+        session_id=session_id,
+    )
+
     async def event_generator():
         try:
             full_answer = ""
-            async for chunk in ask_with_eval(
-                question=request.question,
-                chat_history=history[:-1],
-                top_k=request.top_k,
-                user_id=request.user_id,
-                session_id=session_id,
-            ):
+            if get_settings().eval_gating_enabled:
+                chunks = ask_with_eval(**pipeline_args)
+            else:
+                # ask_stream is a blocking generator; keep it off the event loop
+                chunks = iterate_in_threadpool(ask_stream(**pipeline_args))
+            async for chunk in chunks:
                 yield chunk
                 # Capture full answer from token events
                 if chunk.startswith("data: ") and '"type": "token"' in chunk:
