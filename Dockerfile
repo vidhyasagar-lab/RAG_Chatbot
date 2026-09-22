@@ -10,9 +10,19 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends build-essential libmagic1 && \
     rm -rf /var/lib/apt/lists/*
 
+# UV_CONCURRENT_DOWNLOADS / UV_HTTP_TIMEOUT: uv defaults to ~50 parallel
+# downloads and a 30s per-request timeout. This dependency set pulls several
+# very large wheels (pyarrow 48MB, scipy 34MB, pymupdf 25MB, litellm 23MB), and
+# on a constrained uplink the parallel streams starve each other until small
+# wheels time out mid-flight — the build fails on something tiny like
+# s3transfer while the big ones succeed. Fewer streams each get usable
+# bandwidth; the longer timeout absorbs the rest. Slightly slower on a fast
+# link, but deterministic on a slow one.
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    UV_PYTHON_DOWNLOADS=never
+    UV_PYTHON_DOWNLOADS=never \
+    UV_CONCURRENT_DOWNLOADS=4 \
+    UV_HTTP_TIMEOUT=180
 
 # Install dependencies in their own cached layer, before the source is copied,
 # so code changes don't invalidate the dependency install.
