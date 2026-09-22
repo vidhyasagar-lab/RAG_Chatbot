@@ -341,7 +341,7 @@ layer.
 | `RATE_LIMIT` | `60/minute` | Per-IP request budget (health and static are exempt) |
 | `RATE_LIMIT_ENABLED` | `true` | Set false to disable rate limiting |
 | `DATA_DIR` | `data` | Relational store (`users.db` — users, chats, evals). Moved here from `VECTORSTORE_DIR`; an existing DB is migrated automatically on first start |
-| `EVAL_GATING_ENABLED` | `true` | Enable eval-gated answer pipeline |
+| `EVAL_GATING_ENABLED` | `true` | Verify answers before streaming (`meta → eval → token → done`). `false` streams immediately (`meta → token → done`); scores then come from `/chat/scores/{trace_id}` |
 | `EVAL_QUALITY_THRESHOLD` | `0.5` | Minimum faithfulness to accept an answer |
 | `EVAL_MAX_RETRIES` | `1` | Regeneration attempts when faithfulness is too low |
 | `LANGFUSE_ENABLED` | `true` | Enable Langfuse tracing |
@@ -553,14 +553,32 @@ All API endpoints are prefixed with `/api/v1`. Page routes are served at the roo
 |---|---|---|---|
 | `POST` | `/api/v1/feedback/` | Cookie | Submit thumbs up/down feedback (pushed to Langfuse). Rejects traces the caller does not own |
 
-### Users
+### Auth
 
-Authentication is handled by the server-rendered `/login` and `/register` form
-routes below. There is no JSON user API: the former `POST /api/v1/users/login`
-authenticated on a username alone — no password — and returned the account's
-real `user_id` and role, so it was removed along with the legacy UI that used it.
+JSON endpoints that set the signed, httponly `user_id` session cookie every
+other route reads. Login, register and logout are exempt from the API key;
+`/me` is not, because it reports identity.
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `POST` | `/api/v1/auth/register` | None | `{username, password}` → `201` user + cookie; `400` on validation error |
+| `POST` | `/api/v1/auth/login` | None | `{username, password}` → `200` user + cookie; `401` bad credentials (same response for unknown users); `429` + `Retry-After` while locked out |
+| `POST` | `/api/v1/auth/logout` | None | `204`, clears the cookie |
+| `GET` | `/api/v1/auth/me` | Cookie | `{user_id, username, role, created_at}`, or `401` |
+
+Rate limiting keys on the peer address. Behind a proxy every user shares that
+address, so a request carrying a valid `X-API-Key` may name the real client in
+`X-Client-IP`. The header is ignored without the key, or if it is not an IP.
 
 ### Admin (requires admin role)
+
+Registration always creates a `user`. Create the first admin, or promote an
+existing user, with:
+
+```bash
+uv run python -m app.scripts.create_admin <username>                         # local
+docker compose exec rag-chatbot python -m app.scripts.create_admin <username>  # Docker
+```
 
 | Method | Endpoint | Auth | Description |
 |---|---|---|---|
@@ -579,18 +597,6 @@ real `user_id` and role, so it was removed along with the legacy UI that used it
 | `POST` | `/api/v1/admin/evaluate` | Admin | Start a batch evaluation run |
 | `GET` | `/api/v1/admin/evaluate/runs` | Admin | List evaluation runs |
 | `GET` | `/api/v1/admin/evaluate/runs/{id}` | Admin | Get evaluation run detail with per-sample results |
-
-### Pages (Server-Rendered)
-
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| `GET` | `/` | Session cookie | Login page or chat app (depending on auth state) |
-| `POST` | `/login` | None | Handle login form submission |
-| `POST` | `/register` | None | Handle registration form submission |
-| `GET` | `/logout` | None | Clear session and redirect to login |
-| `GET` | `/admin` | Admin cookie | Admin dashboard page |
-| `GET` | `/partials/stats` | None | HTMX partial — sidebar stats fragment |
-| `GET` | `/partials/doc-history` | Cookie | HTMX partial — document history list |
 
 ---
 
