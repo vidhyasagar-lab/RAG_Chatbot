@@ -147,6 +147,184 @@ def test_auth_me_is_not_public():
     assert "/api/v1/auth/me" not in _PUBLIC_PATHS
 
 
+# ── SEC-6: chat endpoints must verify session ownership ──────────────────
+#
+# GET/PATCH/DELETE /chat/sessions/{id} all compare session["user_id"] against
+# the caller. POST /chat/ and POST /chat/stream did not: _ensure_session
+# returned any client-supplied session_id verbatim, and _load_history then fed
+# that session's last 20 messages to the model as context. An authenticated
+# user could therefore read another user's conversation out of the answer, and
+# write messages into their history.
+
+def _foreign_session(other_user_id="victim-user-id"):
+    from app.core.chat_store import add_message, create_session
+
+    session = create_session(other_user_id, "victim session")
+    add_message(session["session_id"], "user", "my bank account is 1234-5678")
+    add_message(session["session_id"], "assistant", "noted, 1234-5678")
+    return session["session_id"]
+
+
+def _login_fresh_user(client):
+    import uuid
+
+    username = f"user_{uuid.uuid4().hex[:10]}"
+    client.cookies.clear()
+    resp = client.post(
+        "/api/v1/auth/register",
+        json={"username": username, "password": "correct-horse-battery"},
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["user_id"]
+
+
+def test_chat_rejects_a_session_owned_by_another_user(client, monkeypatch):
+    """Posting to a foreign session_id must not be accepted."""
+    import app.api.routes.chat as chat_mod
+
+    captured = {}
+
+    def fake_ask(question, chat_history, top_k, user_id):
+        captured["history"] = chat_history
+        raise AssertionError(
+            "the RAG engine was reached with another user's session; "
+            "ownership must be checked before any retrieval happens"
+        )
+
+    monkeypatch.setattr(chat_mod, "ask", fake_ask)
+
+    victim_session = _foreign_session()
+    _login_fresh_user(client)
+
+    resp = client.post(
+        "/api/v1/chat/",
+        json={"question": "what was the account number?", "session_id": victim_session},
+    )
+    assert resp.status_code == 404, (
+        f"expected 404 for a foreign session, got {resp.status_code}. "
+        f"history leaked to the model: {captured.get('history')}"
+    )
+    client.cookies.clear()
+
+
+def test_chat_stream_rejects_a_session_owned_by_another_user(client, monkeypatch):
+    """/chat/stream shares _ensure_session, so it shares the same hole."""
+    import app.api.routes.chat as chat_mod
+
+    def fake_ask_with_eval(**kwargs):
+        raise AssertionError("stream reached the RAG engine with a foreign session")
+
+    monkeypatch.setattr(chat_mod, "ask_with_eval", fake_ask_with_eval)
+
+    victim_session = _foreign_session("victim-user-2")
+    _login_fresh_user(client)
+
+    resp = client.post(
+        "/api/v1/chat/stream",
+        json={"question": "what was the account number?", "session_id": victim_session},
+    )
+    assert resp.status_code == 404, (
+        f"expected 404 for a foreign session, got {resp.status_code}"
+    )
+    client.cookies.clear()
+
+
+def test_chat_does_not_write_into_a_foreign_session(client, monkeypatch):
+    """The rejection must happen before add_message persists anything."""
+    import app.api.routes.chat as chat_mod
+    from app.core.chat_store import get_recent_messages
+
+    monkeypatch.setattr(chat_mod, "ask", lambda **kw: None)
+
+    victim_session = _foreign_session("victim-user-3")
+    before = len(get_recent_messages(victim_session, limit=50))
+
+    _login_fresh_user(client)
+    client.post(
+        "/api/v1/chat/",
+        json={"question": "injected", "session_id": victim_session},
+    )
+
+    after = get_recent_messages(victim_session, limit=50)
+    assert len(after) == before, (
+        "a message was written into another user's session: "
+        f"{[m['content'] for m in after]}"
+    )
+    client.cookies.clear()
+
+
+# ── SEC-7: CSP must not still permit the removed UI's scripts ────────────
+
+def test_api_responses_deny_all_content_by_default(client):
+    """A JSON-only service should allow nothing at all."""
+    csp = client.get("/api/v1/health").headers["Content-Security-Policy"]
+    assert "default-src 'none'" in csp
+    assert "frame-ancestors 'none'" in csp
+    for stale in ("cdn.tailwindcss.com", "unpkg.com", "'unsafe-inline'"):
+        assert stale not in csp, (
+            f"CSP still carries {stale}, an allowance that existed only for "
+            "the server-rendered UI that was removed"
+        )
+
+
+def test_docs_pages_keep_only_the_allowance_they_need(client):
+    """Swagger/ReDoc need jsdelivr; that exception must not leak elsewhere."""
+    csp = client.get("/docs").headers["Content-Security-Policy"]
+    assert "cdn.jsdelivr.net" in csp
+    assert "cdn.tailwindcss.com" not in csp
+    assert "unpkg.com" not in csp
+
+
+def test_xss_auditor_header_is_disabled(client):
+    """'1; mode=block' is actively discouraged; CSP is the control."""
+    assert client.get("/api/v1/health").headers["X-XSS-Protection"] == "0"
+
+
+# ── SEC-8: every guard must be visible to dependency introspection ───────
+
+def test_no_route_hand_rolls_its_auth_check():
+    """A guard that is not a dependency is invisible to an authz audit.
+
+    /auth/me originally re-derived the user from the cookie inline. It was
+    correct, but an audit enumerating route dependencies reported it as
+    unguarded, and it would not have inherited later hardening of
+    require_authenticated_user.
+    """
+    from fastapi.routing import APIRoute
+
+    from app.api.routes import admin, auth, chat, documents, feedback
+    from app.core.auth import require_admin_user, require_authenticated_user
+
+    guards = {require_authenticated_user, require_admin_user}
+    # APIRoute.path already carries the router's prefix.
+    intentionally_public = {"/auth/login", "/auth/register", "/auth/logout"}
+
+    unguarded = []
+    for router in (auth.router, chat.router, documents.router, feedback.router, admin.router):
+        for r in router.routes:
+            if not isinstance(r, APIRoute):
+                continue
+            if r.path in intentionally_public:
+                continue
+            found, stack = False, list(r.dependant.dependencies)
+            while stack:
+                d = stack.pop()
+                if d.call in guards:
+                    found = True
+                    break
+                stack.extend(d.dependencies)
+            if not found:
+                unguarded.append(f"{sorted(r.methods - {'HEAD'})} {r.path}")
+
+    assert not unguarded, f"routes with no guard dependency: {unguarded}"
+    # Guard the guard: if the traversal stops finding routes, this test would
+    # pass vacuously the way the first version of the audit script did.
+    assert sum(
+        1 for rt in (auth.router, chat.router, documents.router, feedback.router, admin.router)
+        for r in rt.routes if isinstance(r, APIRoute)
+    ) >= 28, "route traversal found almost nothing - the check is not running"
+
+
 def test_api_docs_are_not_public():
     from app.api.middleware import _PUBLIC_PATHS
 

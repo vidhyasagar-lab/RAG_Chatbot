@@ -26,6 +26,30 @@ async def lifespan(app: FastAPI):
     # in-source default, so a missing, placeholder, or too-short value fails
     # when Settings is constructed — before any request can be served.
 
+    # APP_ENV drives the session cookie's Secure flag (see core/auth.py:
+    # secure=not is_dev). A .env carried from a laptop to a server therefore
+    # downgrades every session cookie to plaintext without changing any code
+    # and without failing any test. Nothing here can detect "am I in
+    # production", so this is a loud log line rather than a refusal to start.
+    if settings.app_env.lower() in ("development", "dev", "local"):
+        logger.warning(
+            "insecure_session_cookies",
+            app_env=settings.app_env,
+            detail=(
+                "Session cookies are being issued WITHOUT the Secure flag and "
+                "will travel over plaintext HTTP. Correct for local work; set "
+                "APP_ENV=production before exposing this service."
+            ),
+        )
+    if not settings.api_key:
+        logger.warning(
+            "api_key_unset",
+            detail=(
+                "API_KEY is empty, so APIKeyMiddleware is a no-op and every "
+                "route is reachable by anyone who can reach the port."
+            ),
+        )
+
     # Eagerly initialise the vector store so first request isn't slow
     from app.core.vector_store import get_vector_store
 

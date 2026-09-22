@@ -39,11 +39,34 @@ def _auto_title(question: str) -> str:
     return title[:80] + ("…" if len(title) > 80 else "")
 
 
-def _ensure_session(request: ChatRequest) -> str:
-    """Return an existing session_id or create a new session."""
+def _ensure_session(request: ChatRequest, user_id: str) -> str:
+    """Return the caller's existing session_id, or create a new session.
+
+    A client-supplied session_id is verified against *user_id* before it is
+    used. Without that check this function returned whatever the body asked
+    for, and the caller then fed that session's history to the model and
+    appended to it — so an authenticated user could read another user's
+    conversation out of the answer and write into their history.
+
+    *user_id* is a parameter rather than being read from ``request.user_id``
+    so the check cannot be defeated by calling this before the route has
+    overwritten the body's user_id with the authenticated one.
+
+    404 rather than 403: a wrong owner and a nonexistent session are reported
+    identically, so this does not confirm that someone else's session exists.
+    """
     if request.session_id:
+        session = get_session(request.session_id)
+        if not session or session["user_id"] != user_id:
+            logger.warning(
+                "session_access_denied",
+                session_id=request.session_id,
+                user_id=user_id,
+                exists=bool(session),
+            )
+            raise HTTPException(status_code=404, detail="Session not found")
         return request.session_id
-    session = create_session(request.user_id, _auto_title(request.question))
+    session = create_session(user_id, _auto_title(request.question))
     return session["session_id"]
 
 
@@ -58,7 +81,7 @@ async def chat(request: ChatRequest, current_user: dict = Depends(require_authen
     """Send a question and receive a RAG-augmented answer."""
     # Enforce authenticated user_id instead of trusting request body
     request.user_id = current_user["user_id"]
-    session_id = _ensure_session(request)
+    session_id = _ensure_session(request, current_user["user_id"])
     is_new = not request.session_id
 
     # Save user message
@@ -100,7 +123,7 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
     """Stream a RAG-augmented answer via Server-Sent Events (eval-gated)."""
     # Enforce authenticated user_id instead of trusting request body
     request.user_id = current_user["user_id"]
-    session_id = _ensure_session(request)
+    session_id = _ensure_session(request, current_user["user_id"])
     is_new = not request.session_id
 
     # Save user message

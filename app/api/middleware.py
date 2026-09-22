@@ -27,20 +27,41 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
+        # Explicitly disabled rather than "1; mode=block". The XSS Auditor is
+        # gone from every current browser, and where it survives its filtering
+        # has itself been used to leak cross-origin data. "0" is the value
+        # current guidance recommends; CSP below is the real control.
+        response.headers["X-XSS-Protection"] = "0"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-        # Note: 'unsafe-inline' is required by Tailwind CDN and HTMX runtime styles.
-        # To remove it, switch to a self-hosted Tailwind build with nonce-based CSP.
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://unpkg.com https://cdn.jsdelivr.net; "
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-            "font-src 'self' https://fonts.gstatic.com; "
-            "img-src 'self' data:; "
-            "connect-src 'self'; "
-            "frame-ancestors 'none'"
-        )
+
+        # This service returns JSON and nothing else, so the policy denies
+        # everything by default. The previous policy allowed 'unsafe-inline'
+        # scripts plus cdn.tailwindcss.com, unpkg.com and cdn.jsdelivr.net,
+        # which the Jinja/HTMX UI needed; that UI is gone, and leaving its
+        # allowances in place would silently permit script execution on any
+        # HTML this service ever returned by accident.
+        #
+        # The exception is FastAPI's own docs pages, which are real HTML and
+        # load Swagger/ReDoc bundles from jsdelivr. They are scoped to exactly
+        # those paths rather than relaxing the policy everywhere.
+        if request.url.path in ("/docs", "/redoc", "/docs/oauth2-redirect"):
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; "
+                "script-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+                "style-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; "
+                "img-src 'self' https://fastapi.tiangolo.com data:; "
+                "connect-src 'self'; "
+                "font-src 'self' https://cdn.jsdelivr.net; "
+                "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+            )
+        else:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; "
+                "base-uri 'none'; "
+                "form-action 'none'; "
+                "frame-ancestors 'none'"
+            )
         return response
 
 

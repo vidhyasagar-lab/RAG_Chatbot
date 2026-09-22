@@ -1,5 +1,10 @@
-# Secrets
+﻿# Secrets - every .env variant, not just .env itself.
+# .dockerignore already excluded *.bak*, but .gitignore did not, so a
+# timestamped .env.bak-* backup was swept into a commit by `git add -A`.
+# GitHub push protection rejected it. The negation keeps the template tracked.
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
@@ -19,7 +24,7 @@ env/
 .ruff_cache/
 .mypy_cache/
 
-# Runtime data — the whole directory. users.db lives here and holds
+# Runtime data â€” the whole directory. users.db lives here and holds
 # password hashes, so ignoring only data/vectorstore/ was not enough.
 data/
 

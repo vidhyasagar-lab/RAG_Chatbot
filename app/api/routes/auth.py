@@ -14,18 +14,18 @@ endpoint does not become a username oracle.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Cookie, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
 
 from app.core.auth import (
     check_login_allowed,
     clear_failed_logins,
     clear_session_cookie,
-    get_current_user_id,
     record_failed_login,
+    require_authenticated_user,
     set_session_cookie,
 )
 from app.core.logging import get_logger
-from app.core.user_store import authenticate_user, get_user, register_user
+from app.core.user_store import authenticate_user, register_user
 from app.models.schemas import AuthCredentials, AuthUserResponse
 
 logger = get_logger(__name__)
@@ -103,17 +103,19 @@ async def logout(response: Response) -> Response:
 
 
 @router.get("/me", response_model=AuthUserResponse)
-async def me(user_id: str = Cookie(None)) -> AuthUserResponse:
+async def me(
+    current_user: dict = Depends(require_authenticated_user),
+) -> AuthUserResponse:
     """Return the signed-in user, or 401.
 
     Replaces what ``GET /`` did for the server-rendered app: decide whether
     to show the login screen or the chat screen. A client calls this on load
     to resolve the same question.
+
+    Uses the shared dependency rather than re-deriving the user from the
+    cookie. The hand-rolled version behaved identically, but it was invisible
+    to any audit that enumerates route dependencies to find unguarded
+    endpoints, and it would not inherit future hardening of
+    require_authenticated_user (session revocation, for instance).
     """
-    uid = get_current_user_id(user_id)
-    if not uid:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    user = get_user(uid)
-    if not user:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return _public_user(user)
+    return _public_user(current_user)
