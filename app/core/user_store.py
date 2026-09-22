@@ -144,6 +144,15 @@ def get_user(user_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def get_user_by_username(username: str) -> dict[str, Any] | None:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT user_id, username, created_at, COALESCE(role, 'user') as role FROM users WHERE username = ?",
+        (username.strip(),),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 # ── Document operations ──────────────────────────────────────────────
 
 def record_document(
