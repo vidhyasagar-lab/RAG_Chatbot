@@ -62,8 +62,8 @@ dependencies = [
     # See app/api/rate_limit.py.
     "limits",
 
-    # Templating
-    "jinja2",
+    # No templating engine: this is a headless JSON API. jinja2 was here for
+    # the server-rendered pages that routes/pages.py used to serve.
 ]
 
 [dependency-groups]

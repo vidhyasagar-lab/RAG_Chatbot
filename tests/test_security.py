@@ -135,9 +135,16 @@ def test_forwarded_header_cannot_reset_the_budget():
 def test_register_is_public_alongside_login():
     from app.api.middleware import _PUBLIC_PATHS
 
-    assert "/register" in _PUBLIC_PATHS, (
+    assert "/api/v1/auth/register" in _PUBLIC_PATHS, (
         "enabling API_KEY would break signup while login kept working"
     )
+
+
+def test_auth_me_is_not_public():
+    """/auth/me reports identity, so it must not bypass the API key."""
+    from app.api.middleware import _PUBLIC_PATHS
+
+    assert "/api/v1/auth/me" not in _PUBLIC_PATHS
 
 
 def test_api_docs_are_not_public():
@@ -246,36 +253,47 @@ def test_legacy_static_ui_removed():
 
     import app.main as main_mod
 
-    static_dir = Path(main_mod.__file__).resolve().parent.parent / "static"
-    assert not (static_dir / "index.html").exists(), (
+    root = Path(main_mod.__file__).resolve().parent.parent
+    assert not (root / "static" / "index.html").exists(), (
         "static/index.html is back: it bypassed the API-key gate and "
         "authenticated through the removed passwordless endpoint"
     )
 
 
-# ── SEC-3: model output is sanitised before innerHTML ────────────────────
+def test_no_server_rendered_ui_is_mounted():
+    """The API serves no HTML of its own.
 
-def test_markdown_output_is_sanitised():
+    Guards the headless boundary from both directions: no templates on disk
+    and no StaticFiles mount in the app. Either one returning would mean the
+    server is rendering markup again, which is what the XSS controls below
+    used to exist for.
+    """
     from pathlib import Path
 
+    from starlette.staticfiles import StaticFiles
+
     import app.main as main_mod
+    from app.main import app
 
     root = Path(main_mod.__file__).resolve().parent.parent
-    app_html = (root / "templates" / "app.html").read_text(encoding="utf-8")
-    base_html = (root / "templates" / "base.html").read_text(encoding="utf-8")
+    assert not (root / "templates").exists(), "templates/ is back"
 
-    assert "DOMPurify.sanitize" in app_html, "marked output reaches innerHTML unsanitised"
-    assert "dompurify" in base_html.lower(), "DOMPurify script not loaded"
+    mounted = [r for r in app.routes if isinstance(getattr(r, "app", None), StaticFiles)]
+    assert not mounted, f"a StaticFiles mount is registered: {mounted}"
 
 
-def test_cdn_scripts_are_version_pinned():
-    """An unpinned tag silently follows upstream major versions."""
-    import re
-    from pathlib import Path
-
-    import app.main as main_mod
-
-    base = (Path(main_mod.__file__).resolve().parent.parent / "templates" / "base.html")
-    html = base.read_text(encoding="utf-8")
-    for src in re.findall(r'<script src="(https://(?:cdn\.jsdelivr\.net|unpkg\.com)[^"]+)"', html):
-        assert "@" in src.split("/npm/")[-1] or "@" in src, f"unpinned dependency: {src}"
+# ── SEC-3: model output sanitisation now belongs to the client ───────────
+#
+# Two tests were deleted here, and the guarantee they enforced did not move
+# somewhere else in this repo - it left it.
+#
+#   test_markdown_output_is_sanitised  asserted that app.html ran model
+#       output through DOMPurify.sanitize before assigning innerHTML.
+#   test_cdn_scripts_are_version_pinned  asserted base.html pinned its
+#       jsdelivr/unpkg script tags to a version.
+#
+# Both read templates/ that no longer exists. The RAG engine still returns
+# model-authored markdown, and rendering it with innerHTML is still an XSS
+# sink - but the renderer is now a separate client application, which this
+# suite cannot see. Whatever consumes /api/v1/chat MUST sanitise before
+# rendering; nothing on the server side will catch it if it does not.

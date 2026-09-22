@@ -92,6 +92,27 @@ class UserLoginRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=100, pattern=r"^[\w\-. ]+$")
 
 
+class AuthCredentials(BaseModel):
+    """Login/registration body.
+
+    The username pattern matches UserLoginRequest so the two cannot drift.
+    Password has a floor but no ceiling-side rules here: the authoritative
+    check is register_user's (>= 8 chars), and duplicating it would let the
+    two disagree. min_length=1 only rejects an absent password outright so
+    the 8-char message comes from one place.
+    """
+
+    username: str = Field(..., min_length=1, max_length=100, pattern=r"^[\w\-. ]+$")
+    password: str = Field(..., min_length=1, max_length=1024)
+
+
+class AuthUserResponse(BaseModel):
+    user_id: str
+    username: str
+    role: str
+    created_at: str
+
+
 class UserResponse(BaseModel):
     user_id: str
     username: str

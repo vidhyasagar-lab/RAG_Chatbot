@@ -11,26 +11,61 @@ def test_register_then_login(client):
     username = f"user_{uuid.uuid4().hex[:10]}"
     password = "correct-horse-battery"
 
-    resp = client.post("/register", data={"username": username, "password": password})
-    assert resp.status_code == 200
+    resp = client.post(
+        "/api/v1/auth/register", json={"username": username, "password": password}
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["username"] == username
     assert client.cookies.get("user_id"), "no session cookie set on register"
 
     client.cookies.clear()
-    resp = client.post("/login", data={"username": username, "password": password})
-    assert resp.status_code == 200
+    resp = client.post(
+        "/api/v1/auth/login", json={"username": username, "password": password}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["username"] == username
     assert client.cookies.get("user_id"), "no session cookie set on login"
     client.cookies.clear()
 
 
 def test_login_with_wrong_password_is_rejected(client):
     username = f"user_{uuid.uuid4().hex[:10]}"
-    client.post("/register", data={"username": username, "password": "correct-horse-battery"})
+    client.post(
+        "/api/v1/auth/register",
+        json={"username": username, "password": "correct-horse-battery"},
+    )
     client.cookies.clear()
 
-    resp = client.post("/login", data={"username": username, "password": "wrong-password"})
-    assert resp.status_code == 200          # form re-renders
-    assert "Invalid username or password" in resp.text
+    resp = client.post(
+        "/api/v1/auth/login", json={"username": username, "password": "wrong-password"}
+    )
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "Invalid username or password"
     assert not client.cookies.get("user_id"), "session cookie set despite bad password"
+
+
+def test_login_does_not_reveal_whether_a_username_exists(client):
+    """A wrong password and an unknown user must be indistinguishable.
+
+    The form handler this replaced returned one shared message; keeping that
+    property is the whole reason login does not report "no such user".
+    """
+    known = f"user_{uuid.uuid4().hex[:10]}"
+    client.post(
+        "/api/v1/auth/register",
+        json={"username": known, "password": "correct-horse-battery"},
+    )
+    client.cookies.clear()
+
+    wrong_password = client.post(
+        "/api/v1/auth/login", json={"username": known, "password": "wrong-password"}
+    )
+    unknown_user = client.post(
+        "/api/v1/auth/login",
+        json={"username": f"user_{uuid.uuid4().hex[:10]}", "password": "wrong-password"},
+    )
+    assert wrong_password.status_code == unknown_user.status_code == 401
+    assert wrong_password.json() == unknown_user.json()
 
 
 # ── UX-1: the server minimum the UI must mirror ──────────────────────────
@@ -43,18 +78,21 @@ def test_passwords_under_eight_characters_rejected(password):
         register_user(f"user_{uuid.uuid4().hex[:8]}", password)
 
 
-def test_login_form_advertises_the_real_minimum():
-    """The UI told users 4 while the server required 8."""
-    from pathlib import Path
+def test_register_reports_the_real_password_minimum(client):
+    """The API must state the minimum a client has to mirror.
 
-    import app.main as main_mod
-
-    root = Path(main_mod.__file__).resolve().parent.parent
-    for name in ("login.html", "admin.html"):
-        html = (root / "templates" / name).read_text(encoding="utf-8")
-        assert "Min 4 characters" not in html, f"{name} still advertises a 4-char minimum"
-    login = (root / "templates" / "login.html").read_text(encoding="utf-8")
-    assert 'minlength="8"' in login
+    Originally this asserted that login.html advertised minlength=8, because
+    the UI once told users 4 while the server required 8. With the UI removed
+    the server can no longer check its client's copy, so the guarantee moves
+    to the contract: registration must reject a short password with a message
+    naming the real limit, which is what any client now reads it from.
+    """
+    resp = client.post(
+        "/api/v1/auth/register",
+        json={"username": f"user_{uuid.uuid4().hex[:10]}", "password": "1234567"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "at least 8 characters" in resp.json()["detail"]
 
 
 def test_duplicate_username_rejected():
@@ -97,11 +135,14 @@ def test_session_cookie_is_signed_and_tamper_evident():
 
 def test_logout_clears_the_session_cookie(client):
     username = f"user_{uuid.uuid4().hex[:10]}"
-    client.post("/register", data={"username": username, "password": "correct-horse-battery"})
+    client.post(
+        "/api/v1/auth/register",
+        json={"username": username, "password": "correct-horse-battery"},
+    )
     assert client.cookies.get("user_id")
 
-    resp = client.get("/logout", follow_redirects=False)
-    assert resp.status_code == 302
+    resp = client.post("/api/v1/auth/logout")
+    assert resp.status_code == 204
     set_cookie = resp.headers.get("set-cookie", "")
     assert "user_id=" in set_cookie
     # Attributes must match those used when setting, or the browser keeps

@@ -23,12 +23,6 @@ def test_openapi_schema_builds(client):
     assert len(paths) > 20, f"only {len(paths)} paths registered"
 
 
-def test_login_page_renders(client):
-    resp = client.get("/")
-    assert resp.status_code == 200
-    assert "text/html" in resp.headers["content-type"]
-
-
 def test_security_headers_present(client):
     resp = client.get("/api/v1/health")
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
@@ -36,7 +30,21 @@ def test_security_headers_present(client):
     assert "Content-Security-Policy" in resp.headers
 
 
-def test_htmx_partials_render(client):
-    for path in ("/partials/stats", "/partials/doc-history"):
+def test_no_html_is_served_anywhere(client):
+    """The API is headless: the old page routes must stay gone.
+
+    These are the exact paths the Jinja/HTMX router used to own. Re-adding a
+    server-rendered surface would reintroduce the template dependency this
+    change removed, so it should fail loudly rather than quietly work.
+    """
+    for path in ("/", "/login", "/register", "/logout", "/admin",
+                 "/partials/stats", "/partials/doc-history"):
         resp = client.get(path)
-        assert resp.status_code == 200, f"{path} -> {resp.status_code}"
+        assert resp.status_code == 404, f"{path} still served: {resp.status_code}"
+
+
+def test_auth_endpoints_are_json(client):
+    """The replacements live under /api/v1/auth and speak JSON."""
+    resp = client.post("/api/v1/auth/login", json={"username": "nobody", "password": "x"})
+    assert resp.status_code == 401
+    assert "application/json" in resp.headers["content-type"]

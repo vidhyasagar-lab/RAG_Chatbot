@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from app.api.middleware import APIKeyMiddleware, RequestLoggingMiddleware, SecurityHeadersMiddleware, global_exception_handler
 from app.api.rate_limit import RateLimitMiddleware
-from app.api.routes import chat, documents, health, feedback
+from app.api.routes import auth, chat, documents, health, feedback
 from app.api.routes.admin import router as admin_router
-from app.api.routes.pages import router as pages_router
 from app.config import get_settings
 from app.core.logging import get_logger, setup_logging
 
@@ -45,8 +42,11 @@ def create_app() -> FastAPI:
 
     app = FastAPI(
         title="RAG Chatbot API",
-        description="Production-grade Retrieval-Augmented Generation chatbot powered by Azure OpenAI GPT-5.2",
-        version="1.0.0",
+        description=(
+            "Headless Retrieval-Augmented Generation API powered by Azure "
+            "OpenAI GPT-5.2. JSON only — the UI is a separate client."
+        ),
+        version="2.0.0",
         lifespan=lifespan,
     )
 
@@ -81,19 +81,16 @@ def create_app() -> FastAPI:
     app.add_exception_handler(Exception, global_exception_handler)
 
     # ── Routes ────────────────────────────────────────────────────────
+    # Every route is JSON under /api/v1. There is no server-rendered page
+    # router and no static mount: the client is a separate application that
+    # talks to this API cross-origin, so CORS_ORIGINS is load-bearing rather
+    # than incidental — an origin missing from it cannot sign in at all.
     app.include_router(health.router, prefix="/api/v1")
+    app.include_router(auth.router, prefix="/api/v1")
     app.include_router(chat.router, prefix="/api/v1")
     app.include_router(documents.router, prefix="/api/v1")
     app.include_router(feedback.router, prefix="/api/v1")
     app.include_router(admin_router, prefix="/api/v1")
-
-    # ── Server-rendered pages (Jinja2 + HTMX) ────────────────────────
-    app.include_router(pages_router)
-
-    # ── Static files ──────────────────────────────────────────────────
-    static_dir = Path(__file__).resolve().parent.parent / "static"
-    if static_dir.is_dir():
-        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     return app
 

@@ -89,9 +89,8 @@ def registered_user(client):
     username = f"user_{uuid.uuid4().hex[:10]}"
     password = "correct-horse-battery"
     resp = client.post(
-        "/register",
-        data={"username": username, "password": password},
-        follow_redirects=False,
+        "/api/v1/auth/register",
+        json={"username": username, "password": password},
     )
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 201, resp.text
     return username, password

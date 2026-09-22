@@ -65,18 +65,23 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
 
 # ── Paths that bypass API-key authentication ─────────────────────────
-# The browser-facing entry points only. /register sits alongside /login —
-# omitting it meant enabling API_KEY silently broke signup but not sign-in.
+# The unauthenticated entry points only. /auth/register sits alongside
+# /auth/login — omitting it meant enabling API_KEY silently broke signup but
+# not sign-in. /auth/me is deliberately absent: it reports who you are, which
+# is not something an unauthenticated caller needs.
 # API docs are deliberately NOT public: when API_KEY is set, publishing the
 # full request surface unauthenticated defeats the point of having a key.
 _PUBLIC_PATHS = frozenset({
-    "/",
-    "/login",
-    "/register",
-    "/logout",
+    "/api/v1/auth/login",
+    "/api/v1/auth/register",
+    "/api/v1/auth/logout",
     "/api/v1/health",
 })
-_PUBLIC_PREFIXES = ("/static/", "/partials/")
+# No public prefixes: /static/ and /partials/ served the server-rendered UI,
+# which no longer exists. An empty tuple keeps the any() check below honest
+# rather than leaving dead prefixes that would silently exempt future routes
+# happening to live under those paths.
+_PUBLIC_PREFIXES: tuple[str, ...] = ()
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
