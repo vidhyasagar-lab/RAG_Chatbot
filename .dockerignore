@@ -53,3 +53,33 @@ README.md
 *.log
 .DS_Store
 Thumbs.db
+
+# starter.py is the local one-click launcher: it shells out to `uv sync` and
+# starts uvicorn. In the image the venv is already built and on PATH, so the
+# script is dead weight whose only effect would be to re-run uv at runtime.
+starter.py
+
+# .python-version pins 3.13.12 for local dev, but the image's base interpreter
+# is 3.13.15 (both satisfy requires-python = ">=3.13"). The dependency layer
+# above deliberately does not copy this file - but `COPY . .` would put it back,
+# which defeats that. With UV_PYTHON_DOWNLOADS=never, any `uv run`/`uv sync`
+# inside the container would then demand 3.13.12, fail to find it, be forbidden
+# from fetching it, and error out.
+.python-version
+
+# -- Defensive ---------------------------------------------------------------
+# None of these exist today. They are listed so that adding an editor config,
+# CI workflow, coverage run or a stray database outside data/ does not silently
+# bake it into an image layer.
+.vscode/
+.idea/
+.github/
+.claude/
+htmlcov/
+.coverage
+.coverage.*
+*.bak
+*.bak-*
+*.db
+*.sqlite
+*.sqlite3
