@@ -15,6 +15,9 @@ shape.
 
 from __future__ import annotations
 
+import hmac
+import ipaddress
+
 from limits import parse
 from limits.storage import MemoryStorage
 from limits.strategies import MovingWindowRateLimiter
@@ -31,16 +34,42 @@ _EXEMPT_PATHS = frozenset({"/api/v1/health"})
 _EXEMPT_PREFIXES = ("/static/",)
 
 
+def _from_trusted_proxy(request) -> bool:
+    """True when the request carries the configured API key.
+
+    Only the frontend's server-side proxy holds the key, so its headers can be
+    believed. With no key configured nothing is trusted.
+    """
+    from app.config import get_settings
+
+    key = get_settings().api_key
+    if not key:
+        return False
+    provided = request.headers.get("X-API-Key", "")
+    return hmac.compare_digest(provided.encode(), key.encode())
+
+
 def _client_key(request) -> str:
     """Bucket key for a request.
 
-    Deliberately the *direct* peer address. ``X-Forwarded-For`` is client
+    Normally the *direct* peer address. ``X-Forwarded-For`` is client
     controlled and trivially spoofed, so honouring it would let anyone reset
-    their own budget. Behind a trusted proxy, configure the proxy to set the
-    peer address instead (uvicorn ``--proxy-headers``).
+    their own budget.
+
+    The one exception is ``X-Client-IP`` on a request that also carries a valid
+    API key: that request came from the frontend proxy, where every user shares
+    the proxy's egress address. Anything that is not a valid IP falls back to
+    the peer, so the header cannot mint arbitrary buckets.
     """
     client = request.client
-    return client.host if client and client.host else "unknown"
+    peer = client.host if client and client.host else "unknown"
+    forwarded = request.headers.get("X-Client-IP")
+    if forwarded and _from_trusted_proxy(request):
+        try:
+            return str(ipaddress.ip_address(forwarded.strip()))
+        except ValueError:
+            logger.warning("rate_limit_bad_client_ip", peer=peer)
+    return peer
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
