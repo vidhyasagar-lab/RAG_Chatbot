@@ -149,3 +149,10 @@ def clear_failed_logins(username: str) -> None:
     with _bf_lock:
         _attempts.pop(username, None)
         _lockouts.pop(username, None)
+
+
+def lockout_remaining(username: str) -> int:
+    """Seconds until a locked-out username may try again (at least 1)."""
+    with _bf_lock:
+        until = _lockouts.get(username, 0)
+    return max(1, int(until - time.time()))

@@ -119,6 +119,23 @@ def test_lockout_after_repeated_failures():
     assert check_login_allowed(username) is True, "lockout not cleared on success"
 
 
+def test_locked_out_login_returns_429_with_retry_after(client):
+    """Even the right password is refused while locked, and the client is told
+    when to retry instead of having to guess."""
+    username = f"user_{uuid.uuid4().hex[:10]}"
+    password = "correct-horse-battery"
+    client.post("/api/v1/auth/register", json={"username": username, "password": password})
+    client.cookies.clear()
+
+    for _ in range(5):
+        client.post("/api/v1/auth/login", json={"username": username, "password": "wrong-password"})
+    resp = client.post("/api/v1/auth/login", json={"username": username, "password": password})
+
+    assert resp.status_code == 429
+    assert 0 < int(resp.headers["Retry-After"]) <= 300
+    assert not client.cookies.get("user_id"), "session issued during lockout"
+
+
 # ── Session cookie signing ───────────────────────────────────────────────
 
 def test_session_cookie_is_signed_and_tamper_evident():

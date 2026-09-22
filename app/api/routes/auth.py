@@ -20,6 +20,7 @@ from app.core.auth import (
     check_login_allowed,
     clear_failed_logins,
     clear_session_cookie,
+    lockout_remaining,
     record_failed_login,
     require_authenticated_user,
     set_session_cookie,
@@ -57,6 +58,7 @@ async def login(credentials: AuthCredentials, response: Response) -> AuthUserRes
         raise HTTPException(
             status_code=429,
             detail="Too many failed attempts. Try again in 5 minutes.",
+            headers={"Retry-After": str(lockout_remaining(username))},
         )
 
     user = authenticate_user(username, credentials.password)
