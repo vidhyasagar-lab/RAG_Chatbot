@@ -13,8 +13,16 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import threading
 from typing import Any
+
+# ragas starts an analytics thread on import that POSTs evaluation metadata
+# (metric names, row counts, a generated user id) to t.explodinggradients.com,
+# and retries on failure. Set before any ragas import — which happens lazily
+# inside the functions below — so the thread never starts. setdefault, so an
+# operator who has deliberately set it keeps their value.
+os.environ.setdefault("RAGAS_DO_NOT_TRACK", "true")
 
 from app.config import get_settings
 from app.core.eval_store import (
@@ -35,17 +43,23 @@ from app.core.vector_store import hybrid_search
 logger = get_logger(__name__)
 
 
-def _get_azure_llm():
-    """Create a RAGAS-compatible LLM via LangChain AzureChatOpenAI."""
+def _get_eval_llm():
+    """Create a RAGAS-compatible LLM from the eval_* settings.
+
+    Defaults to the main chat deployment. A separate one can be configured,
+    but measure before switching: on 2026-09-23 gpt-4.1-mini scored the
+    faithfulness metric in 43.8s against gpt-5.2's 24.0s, because the metric's
+    cost sits in the verification call, where a chattier model loses.
+    """
     from ragas.llms import LangchainLLMWrapper
     from langchain_openai import AzureChatOpenAI
 
     settings = get_settings()
     lc_llm = AzureChatOpenAI(
-        model=settings.azure_openai_model,
-        azure_endpoint=settings.azure_openai_endpoint,
-        api_key=settings.azure_openai_api_key,
-        api_version=settings.azure_openai_api_version,
+        model=settings.effective_eval_model,
+        azure_endpoint=settings.effective_eval_endpoint,
+        api_key=settings.effective_eval_api_key,
+        api_version=settings.effective_eval_api_version,
         max_tokens=8192,
     )
     return LangchainLLMWrapper(lc_llm)
@@ -263,7 +277,7 @@ def _evaluate_single_query_sync(
         from ragas.metrics._answer_relevance import AnswerRelevancy
         from ragas.metrics._context_precision import LLMContextPrecisionWithoutReference
 
-        eval_llm = _get_azure_llm()
+        eval_llm = _get_eval_llm()
         eval_embeddings = _get_azure_embeddings()
 
         sample = SingleTurnSample(
@@ -350,7 +364,7 @@ def evaluate_context_precision_sync(
         from ragas.dataset_schema import SingleTurnSample, EvaluationDataset
         from ragas.metrics._context_precision import LLMContextPrecisionWithoutReference
 
-        eval_llm = _get_azure_llm()
+        eval_llm = _get_eval_llm()
 
         sample = SingleTurnSample(
             user_input=question,
@@ -401,7 +415,7 @@ def evaluate_faithfulness_sync(
         from ragas.dataset_schema import SingleTurnSample, EvaluationDataset
         from ragas.metrics._faithfulness import Faithfulness
 
-        eval_llm = _get_azure_llm()
+        eval_llm = _get_eval_llm()
 
         sample = SingleTurnSample(
             user_input=question,
@@ -463,7 +477,7 @@ def _run_evaluation_sync(run_id: str, user_id: str) -> None:
 
         settings = get_settings()
         client = _get_openai_client()
-        eval_llm = _get_azure_llm()
+        eval_llm = _get_eval_llm()
         eval_embeddings = _get_azure_embeddings()
 
         golden = get_golden_dataset()

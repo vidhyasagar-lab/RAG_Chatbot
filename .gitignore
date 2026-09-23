@@ -3,7 +3,7 @@
 # timestamped .env.bak-* backup was swept into a commit by `git add -A`.
 # GitHub push protection rejected it. The negation keeps the template tracked.
 .env
-.env.*
+.env*
 !.env.example
 
 # Python
@@ -36,3 +36,7 @@ uploads/*
 *.log
 .DS_Store
 Thumbs.db
+
+# executing-plans workspace: ledger, briefs, review packages (scratch)
+.superpowers/
+

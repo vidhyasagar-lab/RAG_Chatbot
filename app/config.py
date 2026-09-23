@@ -54,6 +54,32 @@ class Settings(BaseSettings):
     def effective_embedding_api_version(self) -> str:
         return self.azure_openai_embedding_api_version or self.azure_openai_api_version
 
+    # Evaluator-specific overrides (fall back to main Azure OpenAI values).
+    # Measured 2026-09-23 on the faithfulness metric: gpt-5.2 mean 24.0s,
+    # gpt-4.1-mini mean 43.8s. The smaller model wins claim decomposition and
+    # loses verification badly, so these ship unset and gpt-5.2 stays the
+    # evaluator. The seam is here so the choice can change by env var.
+    eval_model: str = ""
+    eval_endpoint: str = ""
+    eval_api_key: str = ""
+    eval_api_version: str = ""
+
+    @property
+    def effective_eval_model(self) -> str:
+        return self.eval_model or self.azure_openai_model
+
+    @property
+    def effective_eval_endpoint(self) -> str:
+        return self.eval_endpoint or self.azure_openai_endpoint
+
+    @property
+    def effective_eval_api_key(self) -> str:
+        return self.eval_api_key or self.azure_openai_api_key
+
+    @property
+    def effective_eval_api_version(self) -> str:
+        return self.eval_api_version or self.azure_openai_api_version
+
     # App
     app_env: str = "production"
     app_host: str = "0.0.0.0"
@@ -118,8 +144,14 @@ class Settings(BaseSettings):
 
     # Eval-gated answers
     eval_gating_enabled: bool = True
-    eval_quality_threshold: float = 0.5  # minimum faithfulness to show answer
+    eval_quality_threshold: float = 0.5  # minimum faithfulness to keep an answer
     eval_max_retries: int = 1  # how many times to regenerate on low quality
+    # The gate runs after the answer has streamed, so it no longer blocks the
+    # reader — but it must still be bounded. A gate that hangs would hold the
+    # SSE connection open forever; one fed an enormous answer costs time
+    # proportional to the claim count it decomposes into.
+    eval_timeout_seconds: int = 120
+    eval_max_answer_chars: int = 6000
 
     # Langfuse Observability
     langfuse_enabled: bool = True
