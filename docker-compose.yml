@@ -3,7 +3,12 @@ services:
     build: .
     container_name: rag-chatbot
     ports:
-      - "8000:8000"
+      # Bound to loopback, not 0.0.0.0. Docker's published ports are inserted
+      # ahead of the host INPUT chain, so a 0.0.0.0 binding is reachable from
+      # anywhere the cloud firewall allows - regardless of local iptables
+      # rules. Caddy terminates TLS and is the only thing that should reach
+      # the app, and it runs on this host.
+      - "127.0.0.1:8000:8000"
     env_file:
       - .env
     volumes:

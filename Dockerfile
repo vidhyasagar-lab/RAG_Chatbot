@@ -53,4 +53,10 @@ EXPOSE 8000
 # would each hold a divergent copy: a document uploaded through one worker is
 # invisible to the others, and the login lockout weakens by a factor of N.
 # Raising this requires moving that state into a shared store first.
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# --proxy-headers with a loopback-only trust list: behind Caddy every request
+# arrives from 127.0.0.1, so the unauthenticated rate-limit path (which falls
+# back to request.client.host - see app/api/rate_limit.py) would bucket every
+# caller together and let one exhaust the login budget for all. Rewriting
+# client.host from X-Forwarded-For fixes that, and restricting the trust to
+# 127.0.0.1 means the header cannot be spoofed from outside.
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1"]
