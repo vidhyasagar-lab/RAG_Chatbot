@@ -15,6 +15,8 @@ previously each did slightly differently:
 from __future__ import annotations
 
 import sqlite3
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from app.config import get_settings
@@ -80,4 +82,37 @@ def connect(db_name: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     logger.info("db_initialised", db=db_name, path=str(path))
+    return conn
+
+
+_local = threading.local()
+_schema_ready: set[str] = set()
+_schema_lock = threading.Lock()
+
+
+def thread_connection(db_name: str, init: Callable[[sqlite3.Connection], None]) -> sqlite3.Connection:
+    """This thread's connection to ``db_name``, opened on first use.
+
+    A sqlite3 connection must not be used by two threads at once. The stores
+    used to share one per process and lock only their writes, so overlapping
+    requests - FastAPI runs sync dependencies such as the auth lookup in a
+    thread pool - corrupted each other's cursors and failed with
+    ``InterfaceError: bad parameter or other API misuse``. One connection per
+    thread removes the sharing; WAL lets those connections read concurrently,
+    and ``busy_timeout`` queues their writes.
+
+    ``init`` creates and migrates the caller's tables. It runs once per process
+    per store, not once per thread.
+    """
+    conns: dict[str, sqlite3.Connection] = getattr(_local, "conns", None) or {}
+    _local.conns = conns
+    conn = conns.get(db_name)
+    if conn is None:
+        conn = conns[db_name] = connect(db_name)
+    key = f"{db_name}:{init.__module__}.{init.__qualname__}"
+    if key not in _schema_ready:
+        with _schema_lock:
+            if key not in _schema_ready:
+                init(conn)
+                _schema_ready.add(key)
     return conn

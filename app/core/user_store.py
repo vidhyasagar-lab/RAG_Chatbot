@@ -19,22 +19,11 @@ logger = get_logger(__name__)
 
 _DB_NAME = "users.db"
 _lock = Lock()
-_conn: sqlite3.Connection | None = None
 
 
 def _get_conn() -> sqlite3.Connection:
-    """Return the shared connection, opening it on first use."""
-    global _conn
-    if _conn is not None:
-        return _conn
-    with _lock:
-        if _conn is not None:
-            return _conn
-        # db.connect() applies WAL + busy_timeout and migrates the file
-        # out of the old vectorstore_dir location if it is still there.
-        _conn = db.connect(_DB_NAME)
-        _init_tables(_conn)
-        return _conn
+    """This thread's connection. Not one shared one: see db.thread_connection."""
+    return db.thread_connection(_DB_NAME, _init_tables)
 
 
 def _init_tables(conn: sqlite3.Connection) -> None:
