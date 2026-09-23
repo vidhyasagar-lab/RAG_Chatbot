@@ -342,22 +342,32 @@ def _evaluate_single_query_sync(
 def evaluate_context_precision_sync(
     question: str,
     contexts: list[str],
+    answer: str,
 ) -> float | None:
     """Run ONLY ContextPrecision synchronously.
 
-    This metric does NOT need the answer — only the question and contexts.
-    This allows it to run IN PARALLEL with answer generation, giving
-    us a free quality check during generation time.
+    The answer is REQUIRED. "Without reference" means without a ground-truth
+    reference answer — the metric judges each retrieved context against the
+    response that was actually produced, and declares ``response`` a required
+    column:
 
-    Returns cached score if same question + contexts seen before.
+        _required_columns = {"user_input", "response", "retrieved_contexts"}
+        _get_row_attributes -> (user_input, retrieved_contexts, response)
+
+    This previously passed the literal string "placeholder", which asked the
+    judge whether each context helped produce the text "placeholder". The
+    answer was always no, so the score was 0.0 for every query ever run.
+
     Returns the context precision score (0.0–1.0) or None on error.
     """
-    if not contexts:
+    if not contexts or not answer.strip():
         return None
 
-    # No cache read here. This metric runs concurrently with answer generation,
-    # so its latency is already hidden behind the LLM call and a hit would save
-    # nothing the reader can perceive.
+    cached = get_eval_cache(question, contexts, answer)
+    if cached and cached.get("context_precision") is not None:
+        logger.info("context_precision_cache_hit")
+        return cached["context_precision"]
+
     try:
         from ragas import evaluate
         from ragas.dataset_schema import SingleTurnSample, EvaluationDataset
@@ -367,7 +377,7 @@ def evaluate_context_precision_sync(
 
         sample = SingleTurnSample(
             user_input=question,
-            response="placeholder",  # not used by this metric
+            response=answer,
             retrieved_contexts=contexts,
         )
         dataset = EvaluationDataset(samples=[sample])

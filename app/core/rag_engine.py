@@ -1,4 +1,4 @@
-﻿"""RAG engine â€“ orchestrates multimodal retrieval and generation.
+"""RAG engine – orchestrates multimodal retrieval and generation.
 
 Supports text + image contexts. When retrieved chunks reference images
 or tables, their descriptions are included in the LLM context and the
@@ -43,7 +43,7 @@ When referencing visual content, be explicit about the source type:
 When referencing text, cite the source document when available.
 
 If the context does not contain enough information to answer, say so \
-honestly â€” do not make things up.
+honestly — do not make things up.
 
 Context:
 {context}
@@ -143,10 +143,10 @@ def ask(
     top_k: int | None = None,
     user_id: str = "",
 ) -> RAGResult:
-    """Run the full multimodal RAG pipeline: retrieve â†’ augment â†’ generate."""
+    """Run the full multimodal RAG pipeline: retrieve → augment → generate."""
     settings = get_settings()
 
-    # â”€â”€ Langfuse trace for the full request â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Langfuse trace for the full request ──────────────────────
     trace = create_trace(
         name="rag-chat",
         user_id=user_id,
@@ -159,7 +159,7 @@ def ask(
         },
     )
 
-    # â”€â”€ Retrieval span â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Retrieval span ───────────────────────────────────────────
     retrieval_span = trace.span(
         name="retrieval",
         input={"query": question, "top_k": top_k},
@@ -181,7 +181,7 @@ def ask(
 
     messages.append({"role": "user", "content": question})
 
-    # â”€â”€ Generation span â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Generation span ──────────────────────────────────────────
     generation = trace.generation(
         name="llm-completion",
         model=settings.azure_openai_model,
@@ -213,7 +213,7 @@ def ask(
     )
     generation.end()
 
-    # â”€â”€ Finalise trace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Finalise trace ───────────────────────────────────────────
     trace.update(output={"answer": answer, "sources_count": len(sources)})
     trace_id = trace.id
     trace.end()
@@ -234,12 +234,12 @@ def ask(
 
 
 
-# â”€â”€ Streaming pipeline with a non-blocking eval gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Streaming pipeline with a non-blocking eval gate ────────────────
 
 REFINED_SYSTEM_PROMPT = """\
 You are a helpful AI assistant. Your previous answer was flagged as \
 potentially unfaithful to the source material. Answer the user's question \
-using ONLY the context provided below. Be strictly factual â€” do not add \
+using ONLY the context provided below. Be strictly factual — do not add \
 information that is not explicitly stated in the context. If the context \
 does not contain enough information, say so.
 
@@ -340,11 +340,11 @@ async def ask_stream(
 
     Event contract (see docs/superpowers/specs/2026-09-23-streaming-eval-gate-design.md):
 
-        meta â†’ stage â†’ token+ â†’ [eval â†’ [replace â†’ stage â†’ token+]] â†’ done
+        meta → stage → token+ → [eval → [replace → stage → token+]] → done
 
-    The gate runs AFTER the answer has streamed. It cannot be made fast â€”
+    The gate runs AFTER the answer has streamed. It cannot be made fast —
     measured at ~24s for gpt-5.2 and ~44s for gpt-4.1-mini on the same
-    sample â€” so it runs where it costs the reader nothing.
+    sample — so it runs where it costs the reader nothing.
 
     ``gated=None`` defers to ``settings.eval_gating_enabled``.
     """
@@ -364,7 +364,7 @@ async def ask_stream(
         },
     )
 
-    # â”€â”€ Retrieval â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Retrieval ────────────────────────────────────────────────
     retrieval_span = trace.span(name="retrieval", input={"query": question, "top_k": top_k})
     context_text, sources, images = _build_context(question, top_k, user_id=user_id)
     retrieval_span.update(output={"sources_count": len(sources), "images_count": len(images)})
@@ -385,17 +385,7 @@ async def ask_stream(
     ]
     client = _get_async_client()
 
-    # context_precision needs only question + contexts, so it starts now and
-    # runs while the answer generates. Its latency is hidden, not removed.
-    precision_task = (
-        asyncio.ensure_future(
-            asyncio.to_thread(evaluate_context_precision_sync, question, context_chunks)
-        )
-        if gated and context_chunks
-        else None
-    )
-
-    # â”€â”€ Attempt 1 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Attempt 1 ────────────────────────────────────────────────
     yield _sse({"type": "stage", "stage": "generating", "attempt": 1})
 
     messages = _build_messages(SYSTEM_PROMPT, context_text, chat_history, question)
@@ -413,8 +403,6 @@ async def ask_stream(
     except asyncio.CancelledError:
         # The reader went away mid-stream (Caddy logs this as
         # "aborting with incomplete response"). Nothing left to do for them.
-        if precision_task:
-            precision_task.cancel()
         gen_span.end()
         raise
 
@@ -426,8 +414,6 @@ async def ask_stream(
     final_answer, final_attempt = answer, 1
 
     if not gated:
-        if precision_task:
-            precision_task.cancel()
         trace.update(output={"answer": answer, "sources_count": len(sources)})
         trace_id = trace.id
         trace.end()
@@ -438,20 +424,29 @@ async def ask_stream(
         yield _sse({"type": "done", "usage": usage, "final_attempt": 1})
         return
 
-    # â”€â”€ The gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── The gate ─────────────────────────────────────────────────
     yield _sse({"type": "stage", "stage": "scoring", "attempt": 1})
-
-    context_precision = await precision_task if precision_task else None
 
     # Cost tracks claim count, which tracks answer length, so cap the input.
     scored_text = answer[: settings.eval_max_answer_chars]
-    eval_span = trace.span(name="faithfulness-gate", input={"answer_len": len(scored_text)})
+    eval_span = trace.span(name="quality-gate", input={"answer_len": len(scored_text)})
+
+    # Both metrics need the answer, so neither can overlap generation. They do
+    # overlap each other: the gate costs max(faithfulness, precision) rather
+    # than their sum, and the whole thing is off the reader's path anyway.
+    async def _scored(fn, *args):
+        return await asyncio.to_thread(fn, *args)
+
     try:
-        faithfulness = await asyncio.wait_for(
-            asyncio.to_thread(evaluate_faithfulness_sync, question, scored_text, context_chunks),
+        faithfulness, context_precision = await asyncio.wait_for(
+            asyncio.gather(
+                _scored(evaluate_faithfulness_sync, question, scored_text, context_chunks),
+                _scored(evaluate_context_precision_sync, question, context_chunks, scored_text),
+            ),
             timeout=settings.eval_timeout_seconds,
         )
     except Exception as exc:
+        context_precision = None
         # Covers the timeout too (asyncio.TimeoutError is an Exception), but
         # deliberately NOT asyncio.CancelledError, which is a BaseException
         # and means the reader disconnected - that should propagate.
@@ -479,7 +474,7 @@ async def ask_stream(
 
     yield _sse({"type": "eval", "attempt": 1, "verdict": verdict, "scores": scores})
 
-    # â”€â”€ Attempt 2, only when regenerating could change the outcome â”€â”€
+    # ── Attempt 2, only when regenerating could change the outcome ──
     if verdict == VERDICT_REJECTED and settings.eval_max_retries > 0:
         logger.warning("faithfulness_gate_failed_regenerating",
                        faithfulness=faithfulness, threshold=threshold, trace_id=trace.id)

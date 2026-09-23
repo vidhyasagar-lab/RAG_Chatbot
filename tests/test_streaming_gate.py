@@ -89,7 +89,7 @@ def _install(
     monkeypatch.setattr(engine, "evaluate_faithfulness_sync", _faith)
     monkeypatch.setattr(
         engine, "evaluate_context_precision_sync",
-        lambda question, contexts: context_precision,
+        lambda question, contexts, answer: context_precision,
     )
     monkeypatch.setattr(engine, "evaluate_query_async", lambda **kw: None)
     return client
@@ -227,6 +227,28 @@ def test_gating_off_streams_without_evaluating(monkeypatch):
     assert types[0] == "meta"
     assert types[-1] == "done"
     assert _text(events, 1) == "draft "
+
+
+def test_context_precision_is_scored_against_the_real_answer(monkeypatch):
+    """LLMContextPrecisionWithoutReference judges contexts AGAINST the response.
+
+    "Without reference" means without a ground-truth answer - it uses the
+    actual one instead, and declares `response` a required column. Passing a
+    placeholder asks whether each context helped produce the text
+    "placeholder", which is always no, pinning the score at 0.0 for every
+    query. That in turn routes every rejection to `retrieval_failed` and
+    disables regeneration entirely.
+    """
+    seen = {}
+
+    _install(monkeypatch, answers=(["the streamed answer"],))
+    monkeypatch.setattr(
+        engine, "evaluate_context_precision_sync",
+        lambda question, contexts, answer: seen.update(answer=answer) or 0.8,
+    )
+    _collect()
+
+    assert seen.get("answer") == "the streamed answer"
 
 
 def test_stage_events_describe_the_phase(monkeypatch):
