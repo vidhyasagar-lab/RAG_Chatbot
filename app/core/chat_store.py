@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -15,22 +16,11 @@ logger = get_logger(__name__)
 
 _DB_NAME = "users.db"  # reuse existing DB
 _lock = Lock()
-_conn: sqlite3.Connection | None = None
 
 
 def _get_conn() -> sqlite3.Connection:
-    """Return the shared connection, opening it on first use."""
-    global _conn
-    if _conn is not None:
-        return _conn
-    with _lock:
-        if _conn is not None:
-            return _conn
-        # db.connect() applies WAL + busy_timeout and migrates the file
-        # out of the old vectorstore_dir location if it is still there.
-        _conn = db.connect(_DB_NAME)
-        _init_tables(_conn)
-        return _conn
+    """This thread's connection. Not one shared one: see db.thread_connection."""
+    return db.thread_connection(_DB_NAME, _init_tables)
 
 
 def _init_tables(conn: sqlite3.Connection) -> None:
@@ -57,6 +47,13 @@ def _init_tables(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_chat_messages_session
             ON chat_messages(session_id, created_at);
     """)
+    # Migrate: assistant messages gained `meta` (JSON: sources, images,
+    # trace_id, eval) so a chat reopened from history shows what each answer
+    # was built on. Rows written before this stay NULL and load as plain text.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(chat_messages)").fetchall()]
+    if "meta" not in cols:
+        conn.execute("ALTER TABLE chat_messages ADD COLUMN meta TEXT")
+        conn.commit()
 
 
 # ── Session operations ───────────────────────────────────────────────
@@ -124,14 +121,14 @@ def _touch_session(conn: sqlite3.Connection, session_id: str) -> None:
 
 # ── Message operations ───────────────────────────────────────────────
 
-def add_message(session_id: str, role: str, content: str) -> str:
+def add_message(session_id: str, role: str, content: str, meta: dict[str, Any] | None = None) -> str:
     conn = _get_conn()
     message_id = uuid.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
     with _lock:
         conn.execute(
-            "INSERT INTO chat_messages (message_id, session_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
-            (message_id, session_id, role, content, now),
+            "INSERT INTO chat_messages (message_id, session_id, role, content, created_at, meta) VALUES (?, ?, ?, ?, ?, ?)",
+            (message_id, session_id, role, content, now, json.dumps(meta) if meta else None),
         )
         _touch_session(conn, session_id)
         conn.commit()
@@ -141,12 +138,20 @@ def add_message(session_id: str, role: str, content: str) -> str:
 def get_session_messages(session_id: str) -> list[dict[str, Any]]:
     conn = _get_conn()
     rows = conn.execute(
-        """SELECT message_id, role, content, created_at
+        """SELECT message_id, role, content, created_at, meta
            FROM chat_messages WHERE session_id = ?
            ORDER BY created_at ASC""",
         (session_id,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    messages = []
+    for r in rows:
+        m = dict(r)
+        try:
+            m["meta"] = json.loads(m["meta"]) if m["meta"] else None
+        except ValueError:
+            m["meta"] = None  # a damaged row still shows its text
+        messages.append(m)
+    return messages
 
 
 def get_recent_messages(session_id: str, limit: int = 20) -> list[dict[str, Any]]:

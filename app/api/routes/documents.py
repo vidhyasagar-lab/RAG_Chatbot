@@ -1,9 +1,11 @@
 """Document upload and management endpoints."""
 
 import asyncio
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse
 
 from app.config import get_settings
 from app.core.auth import require_authenticated_user
@@ -221,6 +223,68 @@ async def delete_user_document(
 
     logger.info("document_deleted", doc_id=doc_id, filename=doc["filename"], chunks_removed=removed)
     return {"status": "deleted", "doc_id": doc_id, "chunks_removed": removed}
+
+
+_FIGURE_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
+
+
+def _figure_of(stem: str, name: str) -> bool:
+    """True if *name* is a figure preprocessing extracted from a document named *stem*.
+
+    Matches the three names preprocessing writes ({stem}_p3_chart.png,
+    {stem}_img2.png, {stem}_smartart1.png) exactly, so a document called
+    "report" does not claim the figures of "report_2024".
+    """
+    return re.match(rf"^{re.escape(stem)}_(p\d+_|img\d+\.|smartart\d+\.)", name) is not None
+
+
+def _owned_figure(raw_path: str, user_id: str) -> Path | None:
+    """The figure at *raw_path* if *user_id* owns it, else None.
+
+    Ownership comes from the database, never from the path: an uploaded image
+    must sit in the user's own folder, and an extracted figure must be named
+    after one of the user's documents. Anything outside the upload folder,
+    missing, or not an image is None, so every refusal looks the same.
+    """
+    root = Path(get_settings().upload_dir).resolve()
+    try:
+        path = Path(raw_path).resolve()
+    except (OSError, ValueError):
+        return None
+    if not path.is_relative_to(root) or path.suffix.lower() not in _FIGURE_TYPES or not path.is_file():
+        return None
+    parts = path.relative_to(root).parts
+    if len(parts) != 2:
+        return None
+    folder, name = parts
+    if folder == user_id:
+        return path
+    if folder == "extracted" and any(_figure_of(Path(d["filename"]).stem, name) for d in get_user_documents(user_id)):
+        return path
+    return None
+
+
+@router.get("/figure")
+async def document_figure(path: str, current_user: dict = Depends(require_authenticated_user)) -> FileResponse:
+    """Serve an image an answer cited (the `images` of the chat stream's meta event)."""
+    figure = _owned_figure(path, current_user["user_id"])
+    if figure is None:
+        raise HTTPException(status_code=404, detail="Figure not found")
+    return FileResponse(
+        figure,
+        media_type=_FIGURE_TYPES[figure.suffix.lower()],
+        # Private: it is one user's document. Figures never change once extracted.
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
 
 
 @router.get("/stats", response_model=CollectionStatsResponse)

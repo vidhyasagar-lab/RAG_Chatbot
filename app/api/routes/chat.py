@@ -157,6 +157,11 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
     # draft glued to the answer that replaced it, so each attempt is kept apart
     # and `done` names the winner.
     answers: dict[int, str] = {}
+    # What each answer was built on, stored with it so a reopened chat can show
+    # its sources and verdict. One verdict per attempt: a rejected draft's
+    # scores must not be filed against the replacement.
+    context: dict = {}
+    verdicts: dict[int, dict] = {}
     saved = False
 
     def _persist(attempt: int | None = None) -> None:
@@ -173,13 +178,16 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
         nonlocal saved
         if saved:
             return
-        text = answers.get(attempt, "") if attempt is not None else ""
-        if not text:
-            text = next((answers[a] for a in sorted(answers, reverse=True) if answers[a]), "")
-        if not text:
+        chosen = attempt if attempt is not None and answers.get(attempt) else None
+        if chosen is None:
+            chosen = next((a for a in sorted(answers, reverse=True) if answers[a]), None)
+        if chosen is None:
             return
         saved = True
-        add_message(session_id, "assistant", text)
+        meta = dict(context)
+        if chosen in verdicts:
+            meta["eval"] = verdicts[chosen]
+        add_message(session_id, "assistant", answers[chosen], meta=meta or None)
         if is_new:
             update_session_title(session_id, _auto_title(request.question))
 
@@ -194,10 +202,24 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
                 except ValueError:
                     continue
 
-                if payload.get("type") == "token":
+                kind = payload.get("type")
+                if kind == "token":
                     attempt = payload.get("attempt", 1)
                     answers[attempt] = answers.get(attempt, "") + payload.get("content", "")
-                elif payload.get("type") == "done":
+                elif kind == "meta":
+                    context.update(
+                        sources=payload.get("sources") or [],
+                        images=payload.get("images") or [],
+                        trace_id=payload.get("trace_id") or "",
+                    )
+                elif kind == "eval":
+                    attempt = payload.get("attempt", 1)
+                    verdicts[attempt] = {
+                        **(payload.get("scores") or {}),
+                        "verdict": payload.get("verdict"),
+                        "attempt": attempt,
+                    }
+                elif kind == "done":
                     _persist(payload.get("final_attempt", 1))
         except Exception:
             logger.exception("rag_stream_error")
@@ -226,7 +248,7 @@ async def list_sessions(current_user: dict = Depends(require_authenticated_user)
     return [ChatSessionInfo(**s) for s in sessions]
 
 
-@router.get("/sessions/{session_id}")
+@router.get("/sessions/{session_id}", response_model_exclude_none=True)
 async def get_session_detail(session_id: str, current_user: dict = Depends(require_authenticated_user)) -> ChatSessionMessages:
     """Get all messages for a chat session."""
     session = get_session(session_id)
@@ -238,7 +260,7 @@ async def get_session_detail(session_id: str, current_user: dict = Depends(requi
     return ChatSessionMessages(
         session_id=session_id,
         title=session["title"],
-        messages=[{"role": m["role"], "content": m["content"]} for m in messages],
+        messages=[{"role": m["role"], "content": m["content"], **(m.get("meta") or {})} for m in messages],
     )
 
 

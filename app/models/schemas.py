@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -144,10 +146,22 @@ class ChatSessionInfo(BaseModel):
     updated_at: str
 
 
+class StoredChatMessage(BaseModel):
+    """A turn as stored. Assistant turns carry what the answer was built on;
+    turns stored before that was recorded have only role and content."""
+
+    role: str
+    content: str
+    sources: list[dict[str, Any]] | None = None
+    images: list[dict[str, Any]] | None = None
+    trace_id: str | None = None
+    eval: dict[str, Any] | None = None
+
+
 class ChatSessionMessages(BaseModel):
     session_id: str
     title: str
-    messages: list[ChatMessageSchema]
+    messages: list[StoredChatMessage]
 
 
 class RenameSessionRequest(BaseModel):
