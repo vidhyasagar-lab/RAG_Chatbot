@@ -76,8 +76,13 @@ exactly **2 HTTP calls**, so the cost is payload size, not retry storms.
 Ordering guarantee:
 
 ```
-meta → stage → token+ → eval → [replace → stage → token+ → eval] → done
+meta → stage → token+ → eval → [replace → stage → token+] → done
 ```
+
+There is no second `eval` after a replacement: the regenerated answer is
+scored in the background, not before `done`. (An `eval` with
+`verdict:"unscored"` does follow attempt 2 in one case — when the
+regeneration came back empty and the draft was kept.)
 
 `replace` means everything streamed so far is superseded. `attempt` tells the
 client which answer a token belongs to; without it a client concatenates the
@@ -110,15 +115,27 @@ and takes the gate as a parameter:
 
 ```
 retrieve → yield meta
-         → start context_precision concurrently
          → stream tokens (attempt 1)
          → gated? no  → done
-                   yes → await context_precision
-                       → faithfulness (bounded by eval_timeout_seconds)
+                   yes → faithfulness + context_precision, concurrently,
+                         bounded by eval_timeout_seconds
                        → verdict
                        → rejected? no  → done
                                    yes → replace → stream tokens (attempt 2) → done
 ```
+
+**Correction (found during implementation).** The original design had
+`context_precision` starting before generation, on the belief that it needs
+only the question and contexts. That is false:
+`LLMContextPrecisionWithoutReference` declares `response` a required column and
+judges each context against the answer that was produced — "without reference"
+means without a *ground-truth* answer, not without the response. The existing
+code passed the literal string `"placeholder"`, which pinned the score at 0.0
+for every query ever run and, with the new verdict table, would have routed
+every rejection to `retrieval_failed` and disabled regeneration entirely.
+
+Both metrics therefore need the answer and run concurrently with each other
+after streaming. The gate costs `max(the two)` rather than their sum.
 
 The regenerated answer is **not** scored synchronously. It goes to
 `evaluate_query_async`, the same background path `ask_stream` already used. That
@@ -162,9 +179,13 @@ property of the answer. On a repeat question with the same retrieved chunks the
 gate reads back a *previous* answer's score and judges the new one by it. The
 key gains the answer.
 
-`context_precision` is genuinely answer-independent, and it runs concurrently
-with generation where its latency is already hidden, so it stops using the cache
-rather than growing a second key.
+`context_precision` turned out to depend on the answer too (see the correction
+above), so it shares the same answer-keyed cache.
+
+One consequence worth naming: when an answer exceeds `eval_max_answer_chars`,
+the gate looks up the *truncated* text while the background eval saves under
+the *full* answer, so the two keys can never coincide and the cache is dead
+weight for that request. That is a lost optimisation, not a wrong result.
 
 ## Expected outcome
 

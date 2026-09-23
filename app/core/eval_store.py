@@ -345,8 +345,10 @@ def _make_cache_key(question: str, contexts: list[str], answer: str = "") -> str
     answer's score for a different answer to the same question, which is how
     an ungrounded reply could inherit a passing verdict.
 
-    Answer-independent metrics (context_precision) pass ``answer=""`` and so
-    keep their own, shared row.
+    ``answer=""`` is still accepted, for a caller that wants a row keyed on the
+    question and contexts alone. No production caller does: context_precision
+    looked answer-independent but is not — ragas judges each context against
+    the response — so it shares this answer-keyed row.
     """
     import hashlib
     normalised = (

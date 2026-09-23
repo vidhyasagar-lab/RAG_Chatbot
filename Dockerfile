@@ -53,10 +53,20 @@ EXPOSE 8000
 # would each hold a divergent copy: a document uploaded through one worker is
 # invisible to the others, and the login lockout weakens by a factor of N.
 # Raising this requires moving that state into a shared store first.
-# --proxy-headers with a loopback-only trust list: behind Caddy every request
-# arrives from 127.0.0.1, so the unauthenticated rate-limit path (which falls
-# back to request.client.host - see app/api/rate_limit.py) would bucket every
-# caller together and let one exhaust the login budget for all. Rewriting
-# client.host from X-Forwarded-For fixes that, and restricting the trust to
-# 127.0.0.1 means the header cannot be spoofed from outside.
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1"]
+# --proxy-headers so the unauthenticated rate-limit path can tell callers
+# apart: it falls back to request.client.host (app/api/rate_limit.py), which
+# without this is the same address for everyone behind the proxy, letting one
+# caller exhaust the login budget for all.
+#
+# The trust list is "*", not "127.0.0.1". Requests do NOT arrive from loopback:
+# the container is bridge-networked, so Docker's userland proxy forwards them
+# in and uvicorn sees the bridge gateway. Verified on the VM - every proxied
+# request logs 172.18.0.1, and only in-container healthchecks log 127.0.0.1.
+# A loopback-only list therefore never matches and the rewrite never happens.
+#
+# "*" is safe here because the trust boundary is the port binding, not this
+# list: docker-compose.yml publishes to 127.0.0.1:8000, so nothing off-host can
+# reach this process at all. Only Caddy can, and Caddy overwrites
+# X-Forwarded-For with the real peer. Widening this WOULD be unsafe if the
+# published port were ever moved back to 0.0.0.0.
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]

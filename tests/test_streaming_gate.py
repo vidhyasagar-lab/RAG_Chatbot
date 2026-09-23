@@ -30,34 +30,56 @@ class _FakeChoice:
     def __init__(self, content): self.delta = _FakeDelta(content)
 
 
+class _FakeUsage:
+    prompt_tokens = 100
+    completion_tokens = 20
+    total_tokens = 120
+
+
 class _FakeChunk:
-    def __init__(self, content): self.choices = [_FakeChoice(content)]
-    usage = None
+    def __init__(self, content, usage=None):
+        self.choices = [_FakeChoice(content)]
+        self.usage = usage
 
 
 class _FakeStream:
-    """Async iterator shaped like the Azure streaming response."""
+    """Async iterator shaped like the Azure streaming response.
 
-    def __init__(self, pieces): self._pieces = pieces
+    Records whether it was closed, because an unclosed stream leaves the HTTP
+    response to Azure open and the socket in CLOSE_WAIT.
+    """
+
+    def __init__(self, pieces):
+        self._pieces = pieces
+        self.closed = False
 
     def __aiter__(self):
         async def gen():
-            for p in self._pieces:
-                yield _FakeChunk(p)
+            for i, p in enumerate(self._pieces):
+                last = i == len(self._pieces) - 1
+                yield _FakeChunk(p, usage=_FakeUsage() if last else None)
         return gen()
+
+    async def close(self):
+        self.closed = True
 
 
 class _FakeCompletions:
     def __init__(self, answers):
         self._answers = list(answers)
         self.calls = 0
+        self.kwargs: list[dict] = []
+        self.streams: list[_FakeStream] = []
 
     async def create(self, **kwargs):
         # Each call streams the next scripted answer, so attempt 2 differs
         # from attempt 1 the way a real regeneration would.
         idx = min(self.calls, len(self._answers) - 1)
         self.calls += 1
-        return _FakeStream(self._answers[idx])
+        self.kwargs.append(kwargs)
+        stream = _FakeStream(self._answers[idx])
+        self.streams.append(stream)
+        return stream
 
 
 class _FakeClient:
@@ -249,6 +271,105 @@ def test_context_precision_is_scored_against_the_real_answer(monkeypatch):
     _collect()
 
     assert seen.get("answer") == "the streamed answer"
+
+
+def test_an_empty_regeneration_does_not_destroy_the_answer(monkeypatch):
+    """Attempt 2 can come back empty - a content filter, an empty completion.
+
+    Switching to it unconditionally leaves the reader with a rejection notice
+    and nothing else, and throws away a draft that was at least readable.
+    """
+    _install(monkeypatch, answers=(["a usable draft"], [""]),
+             faithfulness=0.2, context_precision=0.8)
+    events = _collect()
+
+    assert events[-1]["final_attempt"] == 1, "switched to an empty attempt 2"
+    assert _text(events, 1) == "a usable draft"
+
+
+def test_usage_is_requested_and_reported(monkeypatch):
+    """Azure only attaches usage to a stream when asked, via stream_options.
+
+    Without it every generation span reports zero tokens, so Langfuse shows
+    no cost for any answer.
+    """
+    client = _install(monkeypatch)
+    events = _collect()
+
+    assert client.chat.completions.kwargs[0].get("stream_options") == {"include_usage": True}
+    assert events[-1]["usage"].get("total_tokens") == 120
+
+
+def test_the_answer_stream_is_closed(monkeypatch):
+    """An unclosed stream leaves the HTTP response to Azure open."""
+    client = _install(monkeypatch)
+    _collect()
+
+    assert all(s.closed for s in client.chat.completions.streams)
+
+
+def test_a_long_answer_is_cut_on_a_boundary_not_mid_word(monkeypatch):
+    """Scoring a mid-word fragment invents an unverifiable claim.
+
+    ragas decomposes the dangling fragment, faithfulness drops, and a
+    complete correct answer gets rejected because of where the cut landed.
+    """
+    seen = {}
+    long_answer = ("The ingest pipeline reads each document. " * 400)  # ~16k chars
+
+    _install(monkeypatch, answers=([long_answer],))
+    monkeypatch.setattr(
+        engine, "evaluate_faithfulness_sync",
+        lambda question, answer, contexts: seen.update(scored=answer) or 0.9,
+    )
+    from app.config import get_settings
+    monkeypatch.setattr(get_settings(), "eval_max_answer_chars", 6000)
+    _collect()
+
+    scored = seen["scored"]
+    assert len(scored) <= 6000
+    assert scored.endswith(" ") or scored.endswith(".") or scored == long_answer, (
+        f"cut mid-word: ...{scored[-40:]!r}"
+    )
+
+
+def test_the_async_client_is_reused_across_requests():
+    """A fresh AsyncAzureOpenAI per request leaks an httpx pool per request."""
+    engine._reset_async_client()
+    try:
+        assert engine._get_async_client() is engine._get_async_client()
+    finally:
+        engine._reset_async_client()
+
+
+def test_the_gate_does_not_run_on_the_default_thread_pool():
+    """asyncio.to_thread uses the loop's default executor, sized min(32, cpu+4).
+
+    On the 1 vCPU box that is 5 workers. A gate cannot be cancelled, so a
+    timed-out one keeps its worker; enough of them would starve every other
+    to_thread caller in the process. The gate gets its own pool so the damage
+    cannot spread beyond the gate.
+    """
+    assert engine._EVAL_EXECUTOR is not None
+    assert engine._EVAL_EXECUTOR._max_workers >= 2
+
+
+def test_concurrent_gated_requests_both_complete(monkeypatch):
+    """The concurrency bound must not deadlock two simultaneous readers."""
+    _install(monkeypatch)
+
+    async def run_two():
+        async def one():
+            return [
+                json.loads(c[6:])
+                async for c in engine.ask_stream(question="q", user_id="u",
+                                                 session_id="s", gated=True)
+            ]
+        return await asyncio.gather(one(), one())
+
+    first, second = asyncio.run(run_two())
+    assert first[-1]["type"] == "done"
+    assert second[-1]["type"] == "done"
 
 
 def test_stage_events_describe_the_phase(monkeypatch):

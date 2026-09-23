@@ -1,22 +1,22 @@
-﻿# Docker build context exclusions.
+# Docker build context exclusions.
 #
 # The Dockerfile ends with `COPY . .`, so anything not listed here is baked
-# into an image layer permanently â€” visible via `docker history` / `docker save`
+# into an image layer permanently — visible via `docker history` / `docker save`
 # even when it is absent from the final `docker run` environment.
 
-# â”€â”€ Secrets â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Secrets ───────────────────────────────────────────────────────────
 # Never bake these into a layer. docker-compose supplies them at runtime
 # through `env_file: .env`, so the image does not need them to work.
 .env
 .env*
 !.env.example
 
-# â”€â”€ Runtime data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Runtime data ──────────────────────────────────────────────────────
 # users.db holds PBKDF2 password hashes; both are bind-mounted at runtime.
 data/
 uploads/
 
-# â”€â”€ Virtualenv â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Virtualenv ────────────────────────────────────────────────────────
 # The image builds its own venv with `uv sync` before this COPY runs.
 # Copying the host one over it lands a Windows/macOS pyvenv.cfg and
 # platform-specific binaries on top of the Linux venv.
@@ -24,12 +24,12 @@ uploads/
 venv/
 env/
 
-# â”€â”€ VCS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── VCS ───────────────────────────────────────────────────────────────
 .git/
 .gitignore
 .dockerignore
 
-# â”€â”€ Python caches â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Python caches ─────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
@@ -39,14 +39,14 @@ build/
 .eggs/
 *.egg
 
-# â”€â”€ Tooling / test artefacts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Tooling / test artefacts ──────────────────────────────────────────
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 tests/
 pytest.ini
 
-# â”€â”€ Not needed at runtime â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Not needed at runtime ─────────────────────────────────────────────
 Dockerfile
 docker-compose.yml
 README.md

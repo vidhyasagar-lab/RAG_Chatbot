@@ -43,8 +43,13 @@ def test_the_same_answer_to_a_different_question_is_a_miss():
     assert get_eval_cache("something else entirely", CONTEXTS, answer=GROUNDED) is None
 
 
-def test_answer_independent_scores_can_still_be_cached_without_an_answer():
-    """context_precision does not depend on the answer, so it keys on ''."""
+def test_scores_can_still_be_cached_without_an_answer():
+    """The empty-answer key still works, though nothing in production uses it.
+
+    context_precision looked answer-independent when this was written. It is
+    not - ragas judges each retrieved context against the response - so it
+    shares the answer-keyed row now. Kept as a guard on the default argument.
+    """
     save_eval_cache(QUESTION, CONTEXTS, {"context_precision": 0.75})
 
     cached = get_eval_cache(QUESTION, CONTEXTS)

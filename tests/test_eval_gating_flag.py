@@ -72,6 +72,24 @@ def fake_rejecting_stream(question, chat_history=None, top_k=None, user_id="",
     return gen()
 
 
+def fake_interrupted_stream(question, chat_history=None, top_k=None, user_id="",
+                            session_id="", gated=None):
+    """Tokens complete, then the stream ends without `done`.
+
+    This is what a reader sees when they hit Stop, navigate away or close the
+    tab during the quality gate - a window that is now 25-120s wide, because
+    `done` is emitted after the gate rather than after the last token.
+    """
+    async def gen():
+        yield _meta(session_id)
+        yield _sse({"type": "stage", "stage": "generating", "attempt": 1})
+        yield _sse({"type": "token", "content": "a complete answer", "attempt": 1})
+        yield _sse({"type": "stage", "stage": "scoring", "attempt": 1})
+        # ...and then nothing. No done, no error.
+
+    return gen()
+
+
 @pytest.fixture
 def signed_in(client, monkeypatch):
     import app.api.routes.chat as chat_routes
@@ -122,6 +140,40 @@ def test_gating_off_still_saves_the_answer_to_history(signed_in, monkeypatch):
         ("user", "what changed?"),
         ("assistant", "plain answer"),
     ]
+
+
+def test_an_answer_survives_a_stream_that_ends_before_done(signed_in, monkeypatch):
+    """The reader saw a finished answer; it must not vanish from their history.
+
+    `done` now arrives after the gate, so anything that ends the connection
+    during scoring - Stop, navigation, a closed tab, a sleeping laptop - used
+    to drop a complete answer the route was already holding in memory.
+    """
+    import app.api.routes.chat as chat_routes
+
+    monkeypatch.setattr(chat_routes, "ask_stream", fake_interrupted_stream)
+    _set_gating(monkeypatch, True)
+    session_id = _events(signed_in)[0]["session_id"]
+
+    resp = signed_in.get(f"/api/v1/chat/sessions/{session_id}")
+    assert resp.status_code == 200
+    assert [(m["role"], m["content"]) for m in resp.json()["messages"]] == [
+        ("user", "what changed?"),
+        ("assistant", "a complete answer"),
+    ]
+
+
+def test_an_interrupted_answer_is_saved_only_once(signed_in, monkeypatch):
+    """The `done` path and the fallback must not both write."""
+    import app.api.routes.chat as chat_routes
+
+    monkeypatch.setattr(chat_routes, "ask_stream", fake_stream)
+    _set_gating(monkeypatch, True)
+    session_id = _events(signed_in)[0]["session_id"]
+
+    resp = signed_in.get(f"/api/v1/chat/sessions/{session_id}")
+    assistant = [m for m in resp.json()["messages"] if m["role"] == "assistant"]
+    assert len(assistant) == 1, f"saved {len(assistant)} times"
 
 
 def test_only_the_surviving_answer_reaches_history(signed_in, monkeypatch):

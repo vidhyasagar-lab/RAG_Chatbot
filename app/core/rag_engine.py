@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from openai import AsyncAzureOpenAI, AzureOpenAI
 
@@ -74,13 +75,32 @@ def _get_client() -> AzureOpenAI:
     )
 
 
+_async_client: AsyncAzureOpenAI | None = None
+
+
 def _get_async_client() -> AsyncAzureOpenAI:
-    settings = get_settings()
-    return AsyncAzureOpenAI(
-        api_key=settings.azure_openai_api_key,
-        api_version=settings.azure_openai_api_version,
-        azure_endpoint=settings.azure_openai_endpoint,
-    )
+    """One client for the process, not one per request.
+
+    Each AsyncAzureOpenAI owns an httpx.AsyncClient and its connection pool.
+    Building one per request and never closing it leaks a pool per request,
+    which matters on a 1 OCPU / 2 GB box where this is the only streaming
+    path. The app runs a single uvicorn worker, so one client is enough.
+    """
+    global _async_client
+    if _async_client is None:
+        settings = get_settings()
+        _async_client = AsyncAzureOpenAI(
+            api_key=settings.azure_openai_api_key,
+            api_version=settings.azure_openai_api_version,
+            azure_endpoint=settings.azure_openai_endpoint,
+        )
+    return _async_client
+
+
+def _reset_async_client() -> None:
+    """Drop the cached client. For tests and for settings changes."""
+    global _async_client
+    _async_client = None
 
 
 def _build_context(query: str, top_k: int | None = None, user_id: str = "") -> tuple[str, list[dict], list[dict]]:
@@ -271,6 +291,41 @@ def _build_messages(system_prompt: str, context_text: str,
     return messages
 
 
+# The gate runs ragas in threads and cannot be cancelled: asyncio.to_thread
+# uses the loop's DEFAULT executor, so a timed-out gate keeps its worker and
+# enough of them would starve every other to_thread caller in the process.
+# Giving the gate its own pool confines that to the gate. The semaphore keeps
+# the queue shorter than the pool, so a slow gate delays other gates rather
+# than piling up threads behind them.
+_EVAL_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="eval")
+_EVAL_SLOTS = asyncio.Semaphore(2)
+
+
+async def _run_metric(fn, *args):
+    """Run one blocking ragas metric on the gate's own thread pool."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_EVAL_EXECUTOR, fn, *args)
+
+
+def _truncate_on_boundary(text: str, limit: int) -> str:
+    """Cut `text` to at most `limit` characters, ending at a sentence or word.
+
+    Prefers the last sentence end, then the last whitespace, then the hard
+    limit. Only the tail of a very long answer is affected, and the point is
+    that whatever the gate scores reads as finished text rather than as a
+    sentence that stops halfway.
+    """
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    for end in (". ", ".\n", "! ", "? ", "\n\n"):
+        cut = window.rfind(end)
+        if cut > limit // 2:
+            return window[: cut + len(end)]
+    cut = window.rfind(" ")
+    return window[: cut + 1] if cut > limit // 2 else window
+
+
 def _decide_verdict(faithfulness: float | None,
                     context_precision: float | None,
                     threshold: float) -> str:
@@ -303,17 +358,33 @@ async def _stream_answer(client, messages, settings, attempt: int, into: dict):
         max_completion_tokens=settings.max_tokens,
         temperature=settings.temperature,
         stream=True,
+        # Azure omits usage from streamed responses unless asked. Without this
+        # every generation span reports zero tokens and Langfuse shows no cost.
+        stream_options={"include_usage": True},
     )
     parts: list[str] = []
-    last = None
-    async for chunk in stream:
-        last = chunk
-        if chunk.choices and chunk.choices[0].delta.content:
-            token = chunk.choices[0].delta.content
-            parts.append(token)
-            yield _sse({"type": "token", "content": token, "attempt": attempt})
-    into["text"] = "".join(parts)
-    into["usage"] = _usage_of(last)
+    usage: dict = {}
+    try:
+        async for chunk in stream:
+            # The usage-bearing chunk arrives last and carries no choices.
+            if getattr(chunk, "usage", None):
+                usage = _usage_of(chunk)
+            if chunk.choices and chunk.choices[0].delta.content:
+                token = chunk.choices[0].delta.content
+                parts.append(token)
+                yield _sse({"type": "token", "content": token, "attempt": attempt})
+    finally:
+        # Runs on GeneratorExit too, which is what arrives when the reader
+        # disconnects. An unclosed stream leaves the response to Azure open
+        # and its socket in CLOSE_WAIT.
+        close = getattr(stream, "close", None)
+        if close is not None:
+            try:
+                await close()
+            except Exception:  # pragma: no cover - best effort
+                logger.debug("answer_stream_close_failed")
+        into["text"] = "".join(parts)
+        into["usage"] = usage
 
 
 def _usage_of(chunk) -> dict:
@@ -427,26 +498,40 @@ async def ask_stream(
     # ── The gate ─────────────────────────────────────────────────
     yield _sse({"type": "stage", "stage": "scoring", "attempt": 1})
 
-    # Cost tracks claim count, which tracks answer length, so cap the input.
-    scored_text = answer[: settings.eval_max_answer_chars]
-    eval_span = trace.span(name="quality-gate", input={"answer_len": len(scored_text)})
+    # Cost tracks claim count, which tracks answer length, so cap the input -
+    # but cut on a boundary. A mid-word cut leaves a dangling fragment that
+    # ragas decomposes into an unverifiable claim, which can reject a complete,
+    # correct answer purely because of where the cut landed.
+    scored_text = _truncate_on_boundary(answer, settings.eval_max_answer_chars)
+    eval_span = trace.span(
+        name="quality-gate",
+        input={"answer_len": len(scored_text),
+               "truncated": len(scored_text) < len(answer),
+               "full_answer_len": len(answer)},
+    )
 
     # Both metrics need the answer, so neither can overlap generation. They do
     # overlap each other: the gate costs max(faithfulness, precision) rather
     # than their sum, and the whole thing is off the reader's path anyway.
-    async def _scored(fn, *args):
-        return await asyncio.to_thread(fn, *args)
-
+    #
+    # return_exceptions keeps one metric's failure from discarding the other's
+    # result - notably on timeout, where a score that finished at 118s should
+    # not be thrown away with the one that did not.
+    faithfulness = context_precision = None
     try:
-        faithfulness, context_precision = await asyncio.wait_for(
-            asyncio.gather(
-                _scored(evaluate_faithfulness_sync, question, scored_text, context_chunks),
-                _scored(evaluate_context_precision_sync, question, context_chunks, scored_text),
-            ),
-            timeout=settings.eval_timeout_seconds,
+        async with _EVAL_SLOTS:
+            results = await asyncio.wait_for(
+                asyncio.gather(
+                    _run_metric(evaluate_faithfulness_sync, question, scored_text, context_chunks),
+                    _run_metric(evaluate_context_precision_sync, question, context_chunks, scored_text),
+                    return_exceptions=True,
+                ),
+                timeout=settings.eval_timeout_seconds,
+            )
+        faithfulness, context_precision = (
+            None if isinstance(r, BaseException) else r for r in results
         )
     except Exception as exc:
-        context_precision = None
         # Covers the timeout too (asyncio.TimeoutError is an Exception), but
         # deliberately NOT asyncio.CancelledError, which is a BaseException
         # and means the reader disconnected - that should propagate.
@@ -504,6 +589,22 @@ async def ask_stream(
         # second time before returning, which cost ~74s of a 3m41s request
         # and appeared in no Langfuse span. It is scored in the background
         # below, like every other answer.
+        if not regen_answer.strip():
+            # A content filter or an empty completion. Switching to it would
+            # leave the reader with a rejection notice and nothing else, and
+            # throw away a draft that was at least readable.
+            logger.warning("regeneration_empty_keeping_draft", trace_id=trace.id)
+            yield _sse({
+                "type": "eval", "attempt": 2, "verdict": VERDICT_UNSCORED,
+                "scores": {"faithfulness": None, "context_precision": None,
+                           "threshold": threshold, "passed": False},
+            })
+            yield _sse({"type": "done", "usage": usage, "final_attempt": 1})
+            trace.update(output={"answer": answer, "sources_count": len(sources),
+                                 "verdict": verdict, "final_attempt": 1})
+            trace.end()
+            return
+
         final_answer, final_attempt = regen_answer, 2
         usage = {k: usage.get(k, 0) + regen_usage.get(k, 0)
                  for k in ("prompt_tokens", "completion_tokens", "total_tokens")}

@@ -124,9 +124,14 @@ async def chat(request: ChatRequest, current_user: dict = Depends(require_authen
 async def chat_stream(request: ChatRequest, current_user: dict = Depends(require_authenticated_user)) -> StreamingResponse:
     """Stream a RAG-augmented answer via Server-Sent Events.
 
-    With ``EVAL_GATING_ENABLED`` the answer is verified before any token is
-    sent (meta -> eval -> token -> done); without it tokens stream as they are
-    generated (meta -> token -> done) and scores arrive later via /scores.
+    Tokens are sent as they are generated, whether or not the quality gate is
+    on. With ``EVAL_GATING_ENABLED`` the gate runs after the answer has
+    streamed and may reject it, in which case a replacement follows:
+
+        meta -> stage -> token+ -> [eval -> [replace -> stage -> token+]] -> done
+
+    Each ``token`` carries the ``attempt`` it belongs to, and ``done`` carries
+    ``final_attempt`` - the answer that stands. Only that one is stored.
     """
     # Enforce authenticated user_id instead of trusting request body
     request.user_id = current_user["user_id"]
@@ -147,13 +152,39 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
         session_id=session_id,
     )
 
+    # The gated pipeline can stream two answers: a draft the gate rejects, then
+    # its replacement. Accumulating them into one string would save the rejected
+    # draft glued to the answer that replaced it, so each attempt is kept apart
+    # and `done` names the winner.
+    answers: dict[int, str] = {}
+    saved = False
+
+    def _persist(attempt: int | None = None) -> None:
+        """Write the assistant's answer to the session exactly once.
+
+        `done` is emitted after the quality gate, which takes 25-120s, so
+        anything that ends the connection in that window - Stop, navigation, a
+        closed tab, a sleeping laptop - would otherwise discard an answer the
+        reader has already read in full and that this function is holding.
+
+        Without a `final_attempt` to go on, the newest attempt that produced
+        text is the one the reader was looking at when the connection died.
+        """
+        nonlocal saved
+        if saved:
+            return
+        text = answers.get(attempt, "") if attempt is not None else ""
+        if not text:
+            text = next((answers[a] for a in sorted(answers, reverse=True) if answers[a]), "")
+        if not text:
+            return
+        saved = True
+        add_message(session_id, "assistant", text)
+        if is_new:
+            update_session_title(session_id, _auto_title(request.question))
+
     async def event_generator():
         try:
-            # The gated pipeline can stream two answers: a draft the gate
-            # rejects, then its replacement. Accumulating them into one string
-            # would save the rejected draft glued to the answer that replaced
-            # it, so each attempt is kept apart and `done` names the winner.
-            answers: dict[int, str] = {}
             async for chunk in ask_stream(**pipeline_args):
                 yield chunk
                 if not chunk.startswith("data: "):
@@ -167,14 +198,14 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
                     attempt = payload.get("attempt", 1)
                     answers[attempt] = answers.get(attempt, "") + payload.get("content", "")
                 elif payload.get("type") == "done":
-                    final = answers.get(payload.get("final_attempt", 1), "")
-                    if final:
-                        add_message(session_id, "assistant", final)
-                    if is_new:
-                        update_session_title(session_id, _auto_title(request.question))
+                    _persist(payload.get("final_attempt", 1))
         except Exception:
             logger.exception("rag_stream_error")
             yield 'data: {"type":"error","message":"LLM service error"}\n\n'
+        finally:
+            # Covers the disconnect and the mid-pipeline exception alike. A
+            # no-op when `done` already persisted.
+            _persist()
 
     return StreamingResponse(
         event_generator(),
