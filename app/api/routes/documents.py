@@ -18,6 +18,7 @@ from app.core.document_loader import (
 from app.core.evaluator import generate_golden_for_document
 from app.core.logging import get_logger
 from app.core.observability import create_trace
+from app.core.quota import check_document_quota
 from app.core.user_store import delete_document, get_document, get_user_documents, get_user_stats, record_document
 from app.core.vector_store import add_documents, delete_documents_by_source, get_collection_stats
 from app.models.schemas import (
@@ -65,6 +66,11 @@ async def upload_document(
 ) -> DocumentUploadResponse:
     """Upload a document, chunk it, and index into the vector store."""
     x_user_id = current_user["user_id"]
+
+    # Before the file is read or saved. The count is what the user currently
+    # holds, so deleting a document frees the slot.
+    check_document_quota(current_user, held=len(get_user_documents(x_user_id)))
+
     if not file.filename:
         raise HTTPException(status_code=400, detail="Filename is required")
 

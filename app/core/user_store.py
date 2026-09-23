@@ -56,6 +56,13 @@ def _init_tables(conn: sqlite3.Connection) -> None:
     if "role" not in cols:
         conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
         conn.commit()
+    # The lifetime answer budget. A column rather than a COUNT over
+    # chat_messages, because delete_session deletes a session's messages and a
+    # derived count would refund the quota to anyone who cleared their history.
+    # Existing accounts start at 0 rather than being charged for past chats.
+    if "exchanges_used" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN exchanges_used INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
 
 
 # ── User operations ──────────────────────────────────────────────────
@@ -112,7 +119,8 @@ def authenticate_user(username: str, password: str) -> dict[str, Any] | None:
     conn = _get_conn()
     username = username.strip()
     row = conn.execute(
-        "SELECT user_id, username, password_hash, created_at, COALESCE(role, 'user') as role FROM users WHERE username = ?",
+        "SELECT user_id, username, password_hash, created_at, COALESCE(role, 'user') as role, "
+        "COALESCE(exchanges_used, 0) as exchanges_used FROM users WHERE username = ?",
         (username,),
     ).fetchone()
     if not row:
@@ -127,7 +135,8 @@ def authenticate_user(username: str, password: str) -> dict[str, Any] | None:
 def get_user(user_id: str) -> dict[str, Any] | None:
     conn = _get_conn()
     row = conn.execute(
-        "SELECT user_id, username, created_at, COALESCE(role, 'user') as role FROM users WHERE user_id = ?",
+        "SELECT user_id, username, created_at, COALESCE(role, 'user') as role, "
+        "COALESCE(exchanges_used, 0) as exchanges_used FROM users WHERE user_id = ?",
         (user_id,),
     ).fetchone()
     return dict(row) if row else None
@@ -136,10 +145,32 @@ def get_user(user_id: str) -> dict[str, Any] | None:
 def get_user_by_username(username: str) -> dict[str, Any] | None:
     conn = _get_conn()
     row = conn.execute(
-        "SELECT user_id, username, created_at, COALESCE(role, 'user') as role FROM users WHERE username = ?",
+        "SELECT user_id, username, created_at, COALESCE(role, 'user') as role, "
+        "COALESCE(exchanges_used, 0) as exchanges_used FROM users WHERE username = ?",
         (username.strip(),),
     ).fetchone()
     return dict(row) if row else None
+
+
+def increment_exchanges(user_id: str) -> int:
+    """Charge one exchange against this user's lifetime budget.
+
+    Returns the new total. Incremented in SQL rather than read-modify-write,
+    so two concurrent answers cannot both read the same value and each store
+    used+1, losing a charge.
+    """
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "UPDATE users SET exchanges_used = COALESCE(exchanges_used, 0) + 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT COALESCE(exchanges_used, 0) as used FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    return row["used"] if row else 0
 
 
 # ── Document operations ──────────────────────────────────────────────

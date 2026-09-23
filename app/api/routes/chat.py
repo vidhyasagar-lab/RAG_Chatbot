@@ -18,6 +18,8 @@ from app.core.chat_store import (
 )
 from app.core.eval_store import get_query_scores
 from app.core.logging import get_logger
+from app.core.quota import check_exchange_quota, is_exempt
+from app.core.user_store import increment_exchanges
 from app.core.rag_engine import ChatMessage, ask, ask_stream
 from app.models.schemas import (
     ChatRequest,
@@ -81,6 +83,10 @@ def _load_history(session_id: str) -> list[ChatMessage]:
 @router.post("/", response_model=ChatResponse)
 async def chat(request: ChatRequest, current_user: dict = Depends(require_authenticated_user)) -> ChatResponse:
     """Send a question and receive a RAG-augmented answer."""
+    # Before the session is touched and before anything reaches Azure, so an
+    # exhausted budget costs nothing and leaves no half-started conversation.
+    check_exchange_quota(current_user)
+
     # Enforce authenticated user_id instead of trusting request body
     request.user_id = current_user["user_id"]
     session_id = _ensure_session(request, current_user["user_id"])
@@ -105,6 +111,10 @@ async def chat(request: ChatRequest, current_user: dict = Depends(require_authen
 
     # Save assistant response
     add_message(session_id, "assistant", result.answer)
+    # Charged on delivery, matching /chat/stream: the 502 above returns before
+    # this line, so a failed call does not spend the budget.
+    if not is_exempt(current_user):
+        increment_exchanges(current_user["user_id"])
 
     # Update title from first question if new session
     if is_new:
@@ -133,6 +143,10 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
     Each ``token`` carries the ``attempt`` it belongs to, and ``done`` carries
     ``final_attempt`` - the answer that stands. Only that one is stored.
     """
+    # Before the session is touched and before anything reaches Azure, so an
+    # exhausted budget costs nothing and leaves no half-started conversation.
+    check_exchange_quota(current_user)
+
     # Enforce authenticated user_id instead of trusting request body
     request.user_id = current_user["user_id"]
     session_id = _ensure_session(request, current_user["user_id"])
@@ -188,6 +202,12 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
         if chosen in verdicts:
             meta["eval"] = verdicts[chosen]
         add_message(session_id, "assistant", answers[chosen], meta=meta or None)
+        # Charged here rather than at the start, so the budget tracks answers
+        # the reader actually received: a request that dies before producing
+        # text costs nothing, and one they read in full is charged even if
+        # they disconnect during the quality gate.
+        if not is_exempt(current_user):
+            increment_exchanges(current_user["user_id"])
         if is_new:
             update_session_title(session_id, _auto_title(request.question))
 

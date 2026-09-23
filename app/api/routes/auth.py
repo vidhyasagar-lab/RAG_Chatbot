@@ -26,7 +26,8 @@ from app.core.auth import (
     set_session_cookie,
 )
 from app.core.logging import get_logger
-from app.core.user_store import authenticate_user, register_user
+from app.core.quota import usage_for
+from app.core.user_store import authenticate_user, get_user_documents, register_user
 from app.models.schemas import AuthCredentials, AuthUserResponse
 
 logger = get_logger(__name__)
@@ -35,12 +36,18 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _public_user(user: dict) -> AuthUserResponse:
-    """Project a user row onto the fields safe to return to a client."""
+    """Project a user row onto the fields safe to return to a client.
+
+    Includes the quota so the client can show what is left, and disable the
+    composer or the upload button before someone runs into a 403.
+    """
+    held = len(get_user_documents(user["user_id"]))
     return AuthUserResponse(
         user_id=user["user_id"],
         username=user["username"],
         role=user.get("role", "user"),
         created_at=user.get("created_at", ""),
+        **usage_for(user, held=held),
     )
 
 

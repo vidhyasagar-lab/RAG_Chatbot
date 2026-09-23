@@ -113,6 +113,12 @@ class AuthUserResponse(BaseModel):
     username: str
     role: str
     created_at: str
+    # Quota, so the client can show what is left and stop before a 403.
+    # A limit of None means unmetered (admins); it is not the same as 0.
+    exchanges_used: int = 0
+    exchanges_limit: int | None = None
+    documents_used: int = 0
+    documents_limit: int | None = None
 
 
 class UserResponse(BaseModel):

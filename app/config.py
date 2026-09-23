@@ -142,6 +142,16 @@ class Settings(BaseSettings):
     # almost linearly — bounded to stay under Azure per-deployment rate limits.
     vision_max_concurrency: int = 6
 
+    # Per-user quotas. Every answer costs Azure spend and every upload costs
+    # vision calls plus index space, on a box that is open to the internet, so
+    # a registered account gets a finite budget. Admins are exempt.
+    #
+    # Exchanges are a LIFETIME cap: the count never resets. Documents are a
+    # HELD cap: deleting one frees the slot, so this bounds storage rather
+    # than ingest spend.
+    max_exchanges_per_user: int = 25
+    max_documents_per_user: int = 2
+
     # Eval-gated answers
     eval_gating_enabled: bool = True
     eval_quality_threshold: float = 0.5  # minimum faithfulness to keep an answer
