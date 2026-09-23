@@ -1,10 +1,10 @@
 """Chat endpoints – the core RAG conversation API."""
 
+import json
+
 from fastapi import APIRouter, Cookie, Depends, HTTPException
 from fastapi.responses import Response, StreamingResponse
-from starlette.concurrency import iterate_in_threadpool
 
-from app.config import get_settings
 from app.core.auth import get_current_user_id, require_authenticated_user
 from app.core.chat_store import (
     add_message,
@@ -18,7 +18,7 @@ from app.core.chat_store import (
 )
 from app.core.eval_store import get_query_scores
 from app.core.logging import get_logger
-from app.core.rag_engine import ChatMessage, ask, ask_stream, ask_with_eval
+from app.core.rag_engine import ChatMessage, ask, ask_stream
 from app.models.schemas import (
     ChatRequest,
     ChatResponse,
@@ -149,26 +149,27 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
 
     async def event_generator():
         try:
-            full_answer = ""
-            if get_settings().eval_gating_enabled:
-                chunks = ask_with_eval(**pipeline_args)
-            else:
-                # ask_stream is a blocking generator; keep it off the event loop
-                chunks = iterate_in_threadpool(ask_stream(**pipeline_args))
-            async for chunk in chunks:
+            # The gated pipeline can stream two answers: a draft the gate
+            # rejects, then its replacement. Accumulating them into one string
+            # would save the rejected draft glued to the answer that replaced
+            # it, so each attempt is kept apart and `done` names the winner.
+            answers: dict[int, str] = {}
+            async for chunk in ask_stream(**pipeline_args):
                 yield chunk
-                # Capture full answer from token events
-                if chunk.startswith("data: ") and '"type": "token"' in chunk:
-                    import json as _json
-                    try:
-                        payload = _json.loads(chunk[6:])
-                        full_answer += payload.get("content", "")
-                    except Exception:
-                        pass
-                elif chunk.startswith("data: ") and '"type": "done"' in chunk:
-                    # Save assistant message after streaming completes
-                    if full_answer:
-                        add_message(session_id, "assistant", full_answer)
+                if not chunk.startswith("data: "):
+                    continue
+                try:
+                    payload = json.loads(chunk[6:])
+                except ValueError:
+                    continue
+
+                if payload.get("type") == "token":
+                    attempt = payload.get("attempt", 1)
+                    answers[attempt] = answers.get(attempt, "") + payload.get("content", "")
+                elif payload.get("type") == "done":
+                    final = answers.get(payload.get("final_attempt", 1), "")
+                    if final:
+                        add_message(session_id, "assistant", final)
                     if is_new:
                         update_session_title(session_id, _auto_title(request.question))
         except Exception:

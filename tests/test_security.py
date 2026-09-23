@@ -211,10 +211,10 @@ def test_chat_stream_rejects_a_session_owned_by_another_user(client, monkeypatch
     """/chat/stream shares _ensure_session, so it shares the same hole."""
     import app.api.routes.chat as chat_mod
 
-    def fake_ask_with_eval(**kwargs):
+    def fake_ask_stream(**kwargs):
         raise AssertionError("stream reached the RAG engine with a foreign session")
 
-    monkeypatch.setattr(chat_mod, "ask_with_eval", fake_ask_with_eval)
+    monkeypatch.setattr(chat_mod, "ask_stream", fake_ask_stream)
 
     victim_session = _foreign_session("victim-user-2")
     _login_fresh_user(client)

@@ -1,4 +1,4 @@
-"""RAG engine – orchestrates multimodal retrieval and generation.
+﻿"""RAG engine â€“ orchestrates multimodal retrieval and generation.
 
 Supports text + image contexts. When retrieved chunks reference images
 or tables, their descriptions are included in the LLM context and the
@@ -43,7 +43,7 @@ When referencing visual content, be explicit about the source type:
 When referencing text, cite the source document when available.
 
 If the context does not contain enough information to answer, say so \
-honestly — do not make things up.
+honestly â€” do not make things up.
 
 Context:
 {context}
@@ -143,10 +143,10 @@ def ask(
     top_k: int | None = None,
     user_id: str = "",
 ) -> RAGResult:
-    """Run the full multimodal RAG pipeline: retrieve → augment → generate."""
+    """Run the full multimodal RAG pipeline: retrieve â†’ augment â†’ generate."""
     settings = get_settings()
 
-    # ── Langfuse trace for the full request ──────────────────────
+    # â”€â”€ Langfuse trace for the full request â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     trace = create_trace(
         name="rag-chat",
         user_id=user_id,
@@ -159,7 +159,7 @@ def ask(
         },
     )
 
-    # ── Retrieval span ───────────────────────────────────────────
+    # â”€â”€ Retrieval span â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     retrieval_span = trace.span(
         name="retrieval",
         input={"query": question, "top_k": top_k},
@@ -181,7 +181,7 @@ def ask(
 
     messages.append({"role": "user", "content": question})
 
-    # ── Generation span ──────────────────────────────────────────
+    # â”€â”€ Generation span â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     generation = trace.generation(
         name="llm-completion",
         model=settings.azure_openai_model,
@@ -213,7 +213,7 @@ def ask(
     )
     generation.end()
 
-    # ── Finalise trace ───────────────────────────────────────────
+    # â”€â”€ Finalise trace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     trace.update(output={"answer": answer, "sources_count": len(sources)})
     trace_id = trace.id
     trace.end()
@@ -232,134 +232,14 @@ def ask(
     )
 
 
-def ask_stream(
-    question: str,
-    chat_history: list[ChatMessage] | None = None,
-    top_k: int | None = None,
-    user_id: str = "",
-    session_id: str = "",
-) -> Generator[str, None, None]:
-    """Stream the RAG pipeline: retrieve → augment → generate token-by-token.
-
-    Yields Server-Sent Event (SSE) formatted lines:
-      - ``data: {"type":"meta", ...}``  — sources, images, trace_id
-      - ``data: {"type":"token", "content":"..."}``  — each streamed token
-      - ``data: {"type":"done", "usage":{...}}``  — final usage stats
-    """
-    settings = get_settings()
-
-    trace = create_trace(
-        name="rag-chat",
-        user_id=user_id,
-        session_id=user_id,
-        input={"question": question, "top_k": top_k},
-        tags=["chat", "rag", "stream"],
-        metadata={
-            "chat_history_len": len(chat_history) if chat_history else 0,
-            "model": settings.azure_openai_model,
-        },
-    )
-
-    # ── Retrieval ────────────────────────────────────────────────
-    retrieval_span = trace.span(
-        name="retrieval",
-        input={"query": question, "top_k": top_k},
-    )
-    context_text, sources, images = _build_context(question, top_k, user_id=user_id)
-    retrieval_span.update(
-        output={"sources_count": len(sources), "images_count": len(images)},
-    )
-    retrieval_span.end()
-
-    # Send metadata first so the UI can render sources while tokens stream
-    meta = {
-        "type": "meta",
-        "sources": sources,
-        "images": images,
-        "trace_id": trace.id,
-        "session_id": session_id,
-    }
-    yield f"data: {json.dumps(meta)}\n\n"
-
-    # ── Build messages ───────────────────────────────────────────
-    messages: list[dict[str, str]] = [
-        {"role": "system", "content": SYSTEM_PROMPT.format(context=context_text)},
-    ]
-    if chat_history:
-        for msg in chat_history:
-            messages.append({"role": msg.role, "content": msg.content})
-    messages.append({"role": "user", "content": question})
-
-    # ── Streaming generation ─────────────────────────────────────
-    generation = trace.generation(
-        name="llm-completion",
-        model=settings.azure_openai_model,
-        input=messages,
-        model_parameters={
-            "max_tokens": settings.max_tokens,
-            "temperature": settings.temperature,
-        },
-    )
-
-    client = _get_client()
-    stream = client.chat.completions.create(
-        model=settings.azure_openai_model,
-        messages=messages,
-        max_completion_tokens=settings.max_tokens,
-        temperature=settings.temperature,
-        stream=True,
-    )
-
-    full_answer = ""
-    for chunk in stream:
-        if chunk.choices and chunk.choices[0].delta.content:
-            token = chunk.choices[0].delta.content
-            full_answer += token
-            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
-
-    # ── Finalise tracing ─────────────────────────────────────────
-    usage = {}
-    # The last chunk in Azure OpenAI streams may carry usage info
-    if hasattr(chunk, "usage") and chunk.usage:
-        usage = {
-            "prompt_tokens": chunk.usage.prompt_tokens,
-            "completion_tokens": chunk.usage.completion_tokens,
-            "total_tokens": chunk.usage.total_tokens,
-        }
-
-    generation.update(output=full_answer, usage=usage)
-    generation.end()
-    trace.update(output={"answer": full_answer, "sources_count": len(sources)})
-    trace_id = trace.id
-    trace.end()
-
-    logger.info(
-        "rag_stream_completed",
-        question_len=len(question),
-        context_chunks=len(sources),
-        total_tokens=usage.get("total_tokens"),
-        trace_id=trace_id,
-    )
-
-    # Fire async RAGAS evaluation (background, non-blocking)
-    context_chunks = [part.split("\n", 1)[-1] for part in context_text.split("\n\n---\n\n") if part.strip()]
-    evaluate_query_async(
-        question=question,
-        answer=full_answer,
-        contexts=context_chunks,
-        trace_id=trace_id,
-        user_id=user_id,
-    )
-
-    yield f"data: {json.dumps({'type': 'done', 'usage': usage})}\n\n"
 
 
-# ── Eval-Gated Pipeline ─────────────────────────────────────────────
+# â”€â”€ Streaming pipeline with a non-blocking eval gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 REFINED_SYSTEM_PROMPT = """\
 You are a helpful AI assistant. Your previous answer was flagged as \
 potentially unfaithful to the source material. Answer the user's question \
-using ONLY the context provided below. Be strictly factual — do not add \
+using ONLY the context provided below. Be strictly factual â€” do not add \
 information that is not explicitly stated in the context. If the context \
 does not contain enough information, say so.
 
@@ -367,237 +247,287 @@ Context:
 {context}
 """
 
+# Verdicts, in the order they are tested. Only `rejected` regenerates.
+VERDICT_UNSCORED = "unscored"            # the metric errored or timed out
+VERDICT_PASSED = "passed"                # faithfulness >= threshold
+VERDICT_RETRIEVAL_FAILED = "retrieval_failed"  # nothing relevant was retrieved
+VERDICT_REJECTED = "rejected"            # ungrounded, and retrieval had material
 
-async def _async_generate_answer(
-    client: AsyncAzureOpenAI,
-    messages: list[dict[str, str]],
-    settings,
-) -> tuple[str, dict]:
-    """Generate a complete (non-streaming) answer using async client."""
-    response = await client.chat.completions.create(
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _build_messages(system_prompt: str, context_text: str,
+                    chat_history: list[ChatMessage] | None,
+                    question: str) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": system_prompt.format(context=context_text)},
+    ]
+    if chat_history:
+        for msg in chat_history:
+            messages.append({"role": msg.role, "content": msg.content})
+    messages.append({"role": "user", "content": question})
+    return messages
+
+
+def _decide_verdict(faithfulness: float | None,
+                    context_precision: float | None,
+                    threshold: float) -> str:
+    """First match wins.
+
+    `context_precision is None` means the metric failed and we know nothing;
+    `== 0.0` means retrieval genuinely surfaced nothing relevant. Conflating
+    them would suppress a regeneration that might have helped.
+    """
+    if faithfulness is None:
+        return VERDICT_UNSCORED
+    if faithfulness >= threshold:
+        return VERDICT_PASSED
+    if context_precision == 0.0:
+        return VERDICT_RETRIEVAL_FAILED
+    return VERDICT_REJECTED
+
+
+async def _stream_answer(client, messages, settings, attempt: int, into: dict):
+    """Yield SSE token events as Azure produces them.
+
+    A generator cannot both yield and return a value, so the assembled text
+    and usage land in ``into``, which the caller owns. Caller-owned rather
+    than stashed on the function, because this server handles concurrent
+    requests and function attributes would be shared between them.
+    """
+    stream = await client.chat.completions.create(
         model=settings.azure_openai_model,
         messages=messages,
         max_completion_tokens=settings.max_tokens,
         temperature=settings.temperature,
+        stream=True,
     )
-    answer = response.choices[0].message.content or ""
-    usage = {
-        "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-        "completion_tokens": response.usage.completion_tokens if response.usage else 0,
-        "total_tokens": response.usage.total_tokens if response.usage else 0,
+    parts: list[str] = []
+    last = None
+    async for chunk in stream:
+        last = chunk
+        if chunk.choices and chunk.choices[0].delta.content:
+            token = chunk.choices[0].delta.content
+            parts.append(token)
+            yield _sse({"type": "token", "content": token, "attempt": attempt})
+    into["text"] = "".join(parts)
+    into["usage"] = _usage_of(last)
+
+
+def _usage_of(chunk) -> dict:
+    """Azure may attach usage to the final chunk of a stream."""
+    usage = getattr(chunk, "usage", None)
+    if not usage:
+        return {}
+    return {
+        "prompt_tokens": getattr(usage, "prompt_tokens", 0),
+        "completion_tokens": getattr(usage, "completion_tokens", 0),
+        "total_tokens": getattr(usage, "total_tokens", 0),
     }
-    return answer, usage
 
 
-async def ask_with_eval(
+async def ask_stream(
     question: str,
     chat_history: list[ChatMessage] | None = None,
     top_k: int | None = None,
     user_id: str = "",
     session_id: str = "",
+    gated: bool | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Eval-gated async RAG pipeline with speculative parallelism.
+    """Stream a RAG answer, then evaluate it without making anyone wait.
 
-    Fully async — uses AsyncAzureOpenAI for generation and
-    asyncio.to_thread for CPU-bound RAGAS evaluations.
+    Event contract (see docs/superpowers/specs/2026-09-23-streaming-eval-gate-design.md):
 
-    Latency-optimised flow:
-      1. Retrieve context
-      2. IN PARALLEL: async generate answer + context precision (in thread)
-      3. Run faithfulness check on the generated answer
-      4. If faithfulness < threshold → regenerate with stricter prompt
-      5. Stream the verified answer
-      6. Full 3-metric eval runs in background
+        meta â†’ stage â†’ token+ â†’ [eval â†’ [replace â†’ stage â†’ token+]] â†’ done
 
-    SSE events:
-      - ``data: {"type":"meta", ...}``          — sources, images, trace_id
-      - ``data: {"type":"eval", "scores":{...}}``— quality gate result
-      - ``data: {"type":"token", "content":".."}``— each token of the final answer
-      - ``data: {"type":"done", "usage":{...}}`` — final usage stats
+    The gate runs AFTER the answer has streamed. It cannot be made fast â€”
+    measured at ~24s for gpt-5.2 and ~44s for gpt-4.1-mini on the same
+    sample â€” so it runs where it costs the reader nothing.
+
+    ``gated=None`` defers to ``settings.eval_gating_enabled``.
     """
     settings = get_settings()
+    if gated is None:
+        gated = settings.eval_gating_enabled
 
     trace = create_trace(
-        name="rag-chat-eval-gated",
+        name="rag-chat-streamed" + ("-gated" if gated else ""),
         user_id=user_id,
-        session_id=user_id,
+        session_id=session_id,
         input={"question": question, "top_k": top_k},
-        tags=["chat", "rag", "eval-gated"],
+        tags=["chat", "rag", "stream"] + (["eval-gated"] if gated else []),
         metadata={
             "chat_history_len": len(chat_history) if chat_history else 0,
             "model": settings.azure_openai_model,
         },
     )
 
-    # ── Retrieval ────────────────────────────────────────────────
-    retrieval_span = trace.span(
-        name="retrieval",
-        input={"query": question, "top_k": top_k},
-    )
+    # â”€â”€ Retrieval â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    retrieval_span = trace.span(name="retrieval", input={"query": question, "top_k": top_k})
     context_text, sources, images = _build_context(question, top_k, user_id=user_id)
-    context_chunks = [
-        part.split("\n", 1)[-1] for part in context_text.split("\n\n---\n\n") if part.strip()
-    ]
-    retrieval_span.update(
-        output={"sources_count": len(sources), "images_count": len(images)},
-    )
+    retrieval_span.update(output={"sources_count": len(sources), "images_count": len(images)})
     retrieval_span.end()
 
-    # Send metadata immediately
-    meta = {
+    yield _sse({
         "type": "meta",
         "sources": sources,
         "images": images,
         "trace_id": trace.id,
         "session_id": session_id,
-    }
-    yield f"data: {json.dumps(meta)}\n\n"
+    })
 
-    # ── Build messages ───────────────────────────────────────────
-    messages: list[dict[str, str]] = [
-        {"role": "system", "content": SYSTEM_PROMPT.format(context=context_text)},
+    context_chunks = [
+        part.split("\n", 1)[-1]
+        for part in context_text.split("\n\n---\n\n")
+        if part.strip()
     ]
-    if chat_history:
-        for msg in chat_history:
-            messages.append({"role": msg.role, "content": msg.content})
-    messages.append({"role": "user", "content": question})
+    client = _get_async_client()
 
-    async_client = _get_async_client()
-    threshold = settings.eval_quality_threshold
+    # context_precision needs only question + contexts, so it starts now and
+    # runs while the answer generates. Its latency is hidden, not removed.
+    precision_task = (
+        asyncio.ensure_future(
+            asyncio.to_thread(evaluate_context_precision_sync, question, context_chunks)
+        )
+        if gated and context_chunks
+        else None
+    )
 
-    # ── Step 1: PARALLEL — Async generate + context precision (thread) ──
+    # â”€â”€ Attempt 1 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    yield _sse({"type": "stage", "stage": "generating", "attempt": 1})
+
+    messages = _build_messages(SYSTEM_PROMPT, context_text, chat_history, question)
     gen_span = trace.generation(
-        name="llm-completion-initial",
+        name="llm-completion",
         model=settings.azure_openai_model,
         input=messages,
-        model_parameters={
-            "max_tokens": settings.max_tokens,
-            "temperature": settings.temperature,
-        },
+        model_parameters={"max_tokens": settings.max_tokens,
+                          "temperature": settings.temperature},
     )
+    draft: dict = {"text": "", "usage": {}}
+    try:
+        async for event in _stream_answer(client, messages, settings, 1, draft):
+            yield event
+    except asyncio.CancelledError:
+        # The reader went away mid-stream (Caddy logs this as
+        # "aborting with incomplete response"). Nothing left to do for them.
+        if precision_task:
+            precision_task.cancel()
+        gen_span.end()
+        raise
 
-    # Run generation (async) and context precision (sync in thread) concurrently
-    gen_task = asyncio.ensure_future(
-        _async_generate_answer(async_client, messages, settings)
-    )
-    ctx_prec_task = asyncio.ensure_future(
-        asyncio.to_thread(evaluate_context_precision_sync, question, context_chunks)
-    )
-
-    # Await both concurrently
-    (answer, usage), context_precision = await asyncio.gather(gen_task, ctx_prec_task)
+    answer = draft["text"]
+    usage = dict(draft["usage"])
     gen_span.update(output=answer, usage=usage)
     gen_span.end()
 
-    logger.info("context_precision_parallel_done", context_precision=context_precision)
+    final_answer, final_attempt = answer, 1
 
-    # ── Step 2: Faithfulness gate (needs the answer) ─────────────
-    eval_span = trace.span(name="faithfulness-gate", input={"answer_len": len(answer)})
-    faithfulness = await asyncio.to_thread(
-        evaluate_faithfulness_sync, question, answer, context_chunks
-    )
-    passed = faithfulness is None or faithfulness >= threshold
+    if not gated:
+        if precision_task:
+            precision_task.cancel()
+        trace.update(output={"answer": answer, "sources_count": len(sources)})
+        trace_id = trace.id
+        trace.end()
+        evaluate_query_async(question=question, answer=answer, contexts=context_chunks,
+                             trace_id=trace_id, user_id=user_id)
+        logger.info("rag_stream_completed", question_len=len(question),
+                    context_chunks=len(sources), trace_id=trace_id)
+        yield _sse({"type": "done", "usage": usage, "final_attempt": 1})
+        return
 
-    eval_result = {
-        "type": "eval",
-        "scores": {
-            "context_precision": context_precision,
-            "faithfulness": faithfulness,
-            "threshold": threshold,
-            "passed": passed,
-        },
+    # â”€â”€ The gate â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    yield _sse({"type": "stage", "stage": "scoring", "attempt": 1})
+
+    context_precision = await precision_task if precision_task else None
+
+    # Cost tracks claim count, which tracks answer length, so cap the input.
+    scored_text = answer[: settings.eval_max_answer_chars]
+    eval_span = trace.span(name="faithfulness-gate", input={"answer_len": len(scored_text)})
+    try:
+        faithfulness = await asyncio.wait_for(
+            asyncio.to_thread(evaluate_faithfulness_sync, question, scored_text, context_chunks),
+            timeout=settings.eval_timeout_seconds,
+        )
+    except Exception as exc:
+        # Covers the timeout too (asyncio.TimeoutError is an Exception), but
+        # deliberately NOT asyncio.CancelledError, which is a BaseException
+        # and means the reader disconnected - that should propagate.
+        #
+        # A gate that fails must never cost the reader the answer they can
+        # already see. Report it as unscored and keep the draft.
+        #
+        # Note: asyncio.to_thread cannot be cancelled, so on timeout the
+        # ragas call keeps running to completion in its worker thread. It is
+        # abandoned, not killed; it holds one thread until it finishes.
+        logger.warning("faithfulness_gate_unavailable",
+                       error=f"{type(exc).__name__}: {exc}", trace_id=trace.id)
+        faithfulness = None
+
+    threshold = settings.eval_quality_threshold
+    verdict = _decide_verdict(faithfulness, context_precision, threshold)
+    scores = {
+        "faithfulness": faithfulness,
+        "context_precision": context_precision,
+        "threshold": threshold,
+        "passed": verdict == VERDICT_PASSED,
     }
-    eval_span.update(output=eval_result["scores"])
+    eval_span.update(output={**scores, "verdict": verdict})
     eval_span.end()
 
-    yield f"data: {json.dumps(eval_result)}\n\n"
+    yield _sse({"type": "eval", "attempt": 1, "verdict": verdict, "scores": scores})
 
-    final_answer = answer
-    total_usage = dict(usage)
+    # â”€â”€ Attempt 2, only when regenerating could change the outcome â”€â”€
+    if verdict == VERDICT_REJECTED and settings.eval_max_retries > 0:
+        logger.warning("faithfulness_gate_failed_regenerating",
+                       faithfulness=faithfulness, threshold=threshold, trace_id=trace.id)
+        yield _sse({
+            "type": "replace",
+            "reason": f"faithfulness {faithfulness:.2f} < {threshold:.2f}",
+        })
+        yield _sse({"type": "stage", "stage": "regenerating", "attempt": 2})
 
-    # ── Step 3: Regenerate if faithfulness failed ────────────────
-    if not passed and settings.eval_max_retries > 0:
-        logger.warning(
-            "faithfulness_gate_failed_regenerating",
-            faithfulness=faithfulness,
-            threshold=threshold,
-            trace_id=trace.id,
-        )
-
-        refined_messages: list[dict[str, str]] = [
-            {"role": "system", "content": REFINED_SYSTEM_PROMPT.format(context=context_text)},
-        ]
-        if chat_history:
-            for msg in chat_history:
-                refined_messages.append({"role": msg.role, "content": msg.content})
-        refined_messages.append({"role": "user", "content": question})
-
+        refined = _build_messages(REFINED_SYSTEM_PROMPT, context_text, chat_history, question)
         regen_span = trace.generation(
             name="llm-completion-regenerated",
             model=settings.azure_openai_model,
-            input=refined_messages,
-            model_parameters={
-                "max_tokens": settings.max_tokens,
-                "temperature": max(settings.temperature - 0.1, 0.0),
-            },
+            input=refined,
+            model_parameters={"max_tokens": settings.max_tokens,
+                              "temperature": max(settings.temperature - 0.1, 0.0)},
         )
-
-        regen_answer, regen_usage = await _async_generate_answer(
-            async_client, refined_messages, settings
-        )
+        replacement: dict = {"text": "", "usage": {}}
+        async for event in _stream_answer(client, refined, settings, 2, replacement):
+            yield event
+        regen_answer = replacement["text"]
+        regen_usage = replacement["usage"]
         regen_span.update(output=regen_answer, usage=regen_usage)
         regen_span.end()
 
-        # Check regenerated answer faithfulness
-        regen_faith = await asyncio.to_thread(
-            evaluate_faithfulness_sync, question, regen_answer, context_chunks
-        )
-        regen_passed = regen_faith is None or regen_faith >= threshold
+        # Deliberately NOT scored here. The old pipeline ran the metric a
+        # second time before returning, which cost ~74s of a 3m41s request
+        # and appeared in no Langfuse span. It is scored in the background
+        # below, like every other answer.
+        final_answer, final_attempt = regen_answer, 2
+        usage = {k: usage.get(k, 0) + regen_usage.get(k, 0)
+                 for k in ("prompt_tokens", "completion_tokens", "total_tokens")}
+    elif verdict == VERDICT_RETRIEVAL_FAILED:
+        logger.info("regeneration_skipped_retrieval_failed",
+                    faithfulness=faithfulness, trace_id=trace.id)
 
-        if regen_passed or (regen_faith is not None and faithfulness is not None and regen_faith > faithfulness):
-            final_answer = regen_answer
-            total_usage = {
-                k: total_usage.get(k, 0) + regen_usage.get(k, 0)
-                for k in ("prompt_tokens", "completion_tokens", "total_tokens")
-            }
-            yield f"data: {json.dumps({'type': 'eval', 'scores': {'context_precision': context_precision, 'faithfulness': regen_faith, 'threshold': threshold, 'passed': regen_passed, 'regenerated': True}})}\n\n"
-
-            logger.info(
-                "faithfulness_gate_regenerated",
-                original_score=faithfulness,
-                new_score=regen_faith,
-                trace_id=trace.id,
-            )
-
-    # ── Step 4: Stream the final answer token-by-token ───────────
-    chunk_size = 4  # characters per token event
-    for i in range(0, len(final_answer), chunk_size):
-        token = final_answer[i:i + chunk_size]
-        yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
-
-    # ── Finalise tracing ─────────────────────────────────────────
-    trace.update(output={"answer": final_answer, "sources_count": len(sources)})
+    trace.update(output={"answer": final_answer, "sources_count": len(sources),
+                         "verdict": verdict, "final_attempt": final_attempt})
     trace_id = trace.id
     trace.end()
 
-    logger.info(
-        "rag_eval_gated_completed",
-        question_len=len(question),
-        context_chunks=len(sources),
-        total_tokens=total_usage.get("total_tokens"),
-        context_precision=context_precision,
-        faithfulness=faithfulness,
-        trace_id=trace_id,
-    )
+    logger.info("rag_stream_gated_completed", question_len=len(question),
+                context_chunks=len(sources), verdict=verdict,
+                final_attempt=final_attempt, faithfulness=faithfulness,
+                context_precision=context_precision, trace_id=trace_id)
 
-    # Fire remaining metrics (answer_relevancy) in background
-    # Context precision + faithfulness already computed above
-    evaluate_query_async(
-        question=question,
-        answer=final_answer,
-        contexts=context_chunks,
-        trace_id=trace_id,
-        user_id=user_id,
-    )
+    evaluate_query_async(question=question, answer=final_answer, contexts=context_chunks,
+                         trace_id=trace_id, user_id=user_id)
 
-    yield f"data: {json.dumps({'type': 'done', 'usage': total_usage})}\n\n"
+    yield _sse({"type": "done", "usage": usage, "final_attempt": final_attempt})
+

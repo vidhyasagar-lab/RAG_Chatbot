@@ -1,8 +1,12 @@
-"""EVAL_GATING_ENABLED chooses which pipeline /chat/stream runs.
+"""EVAL_GATING_ENABLED changes what /chat/stream emits, not whether it streams.
 
-Both pipelines call Azure OpenAI, so each is replaced at that boundary by a
-stub emitting the same SSE event shapes the real one does (captured from a
-live run: meta -> [eval ->] token -> done).
+Before 2026-09-23 the flag chose between two pipelines and only one of them
+streamed, so turning gating on silently turned streaming off. Now there is one
+pipeline: the flag decides whether the gate runs after the tokens, and tokens
+go out either way.
+
+ask_stream calls Azure, so it is replaced here by a stub emitting the same SSE
+shapes the real one does.
 """
 
 from __future__ import annotations
@@ -18,31 +22,61 @@ def _sse(payload: dict) -> str:
 
 
 def _meta(session_id: str) -> str:
-    return _sse({"type": "meta", "sources": [], "images": [], "trace_id": "t-1", "session_id": session_id})
+    return _sse({"type": "meta", "sources": [], "images": [],
+                 "trace_id": "t-1", "session_id": session_id})
 
 
-def fake_plain_stream(question, chat_history=None, top_k=None, user_id="", session_id=""):
-    """Sync generator, like the real ask_stream."""
-    yield _meta(session_id)
-    yield _sse({"type": "token", "content": "plain "})
-    yield _sse({"type": "token", "content": "answer"})
-    yield _sse({"type": "done", "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}})
+def fake_stream(question, chat_history=None, top_k=None, user_id="",
+                session_id="", gated=None):
+    """Async generator matching the real ask_stream's contract."""
+    from app.config import get_settings
+
+    if gated is None:
+        gated = get_settings().eval_gating_enabled
+
+    async def gen():
+        yield _meta(session_id)
+        yield _sse({"type": "stage", "stage": "generating", "attempt": 1})
+        yield _sse({"type": "token", "content": "plain ", "attempt": 1})
+        yield _sse({"type": "token", "content": "answer", "attempt": 1})
+        if gated:
+            yield _sse({"type": "stage", "stage": "scoring", "attempt": 1})
+            yield _sse({
+                "type": "eval", "attempt": 1, "verdict": "passed",
+                "scores": {"context_precision": 0.9, "faithfulness": 0.95,
+                           "threshold": 0.5, "passed": True},
+            })
+        yield _sse({"type": "done", "usage": {"total_tokens": 3}, "final_attempt": 1})
+
+    return gen()
 
 
-async def fake_gated_stream(question, chat_history=None, top_k=None, user_id="", session_id=""):
-    """Async generator, like the real ask_with_eval."""
-    yield _meta(session_id)
-    yield _sse({"type": "eval", "scores": {"context_precision": 0.9, "faithfulness": 0.95, "threshold": 0.75, "passed": True}})
-    yield _sse({"type": "token", "content": "gated answer"})
-    yield _sse({"type": "done", "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}})
+def fake_rejecting_stream(question, chat_history=None, top_k=None, user_id="",
+                          session_id="", gated=None):
+    """A gate that rejects the draft and streams a replacement."""
+    async def gen():
+        yield _meta(session_id)
+        yield _sse({"type": "stage", "stage": "generating", "attempt": 1})
+        yield _sse({"type": "token", "content": "ungrounded draft", "attempt": 1})
+        yield _sse({"type": "stage", "stage": "scoring", "attempt": 1})
+        yield _sse({
+            "type": "eval", "attempt": 1, "verdict": "rejected",
+            "scores": {"context_precision": 0.8, "faithfulness": 0.2,
+                       "threshold": 0.5, "passed": False},
+        })
+        yield _sse({"type": "replace", "reason": "faithfulness 0.20 < 0.50"})
+        yield _sse({"type": "stage", "stage": "regenerating", "attempt": 2})
+        yield _sse({"type": "token", "content": "grounded answer", "attempt": 2})
+        yield _sse({"type": "done", "usage": {"total_tokens": 6}, "final_attempt": 2})
+
+    return gen()
 
 
 @pytest.fixture
 def signed_in(client, monkeypatch):
     import app.api.routes.chat as chat_routes
 
-    monkeypatch.setattr(chat_routes, "ask_stream", fake_plain_stream)
-    monkeypatch.setattr(chat_routes, "ask_with_eval", fake_gated_stream)
+    monkeypatch.setattr(chat_routes, "ask_stream", fake_stream)
     client.cookies.clear()
     resp = client.post(
         "/api/v1/auth/register",
@@ -65,17 +99,17 @@ def _set_gating(monkeypatch, enabled: bool) -> None:
     monkeypatch.setattr(get_settings(), "eval_gating_enabled", enabled)
 
 
-def test_gating_off_streams_the_plain_pipeline(signed_in, monkeypatch):
+def test_gating_off_streams_without_an_eval_event(signed_in, monkeypatch):
     _set_gating(monkeypatch, False)
     events = _events(signed_in)
-    assert [e["type"] for e in events] == ["meta", "token", "token", "done"]
-    assert "".join(e["content"] for e in events if e["type"] == "token") == "plain answer"
+    assert [e["type"] for e in events] == ["meta", "stage", "token", "token", "done"]
 
 
-def test_gating_on_streams_the_eval_gated_pipeline(signed_in, monkeypatch):
+def test_gating_on_still_streams_tokens_before_the_eval(signed_in, monkeypatch):
+    """The regression that motivated this work: gating used to stop streaming."""
     _set_gating(monkeypatch, True)
-    events = _events(signed_in)
-    assert [e["type"] for e in events] == ["meta", "eval", "token", "done"]
+    types = [e["type"] for e in _events(signed_in)]
+    assert types.index("token") < types.index("eval")
 
 
 def test_gating_off_still_saves_the_answer_to_history(signed_in, monkeypatch):
@@ -84,8 +118,22 @@ def test_gating_off_still_saves_the_answer_to_history(signed_in, monkeypatch):
 
     resp = signed_in.get(f"/api/v1/chat/sessions/{session_id}")
     assert resp.status_code == 200
-    messages = resp.json()["messages"]
-    assert [(m["role"], m["content"]) for m in messages] == [
+    assert [(m["role"], m["content"]) for m in resp.json()["messages"]] == [
         ("user", "what changed?"),
         ("assistant", "plain answer"),
     ]
+
+
+def test_only_the_surviving_answer_reaches_history(signed_in, monkeypatch):
+    """A rejected draft was shown as a demonstration, not offered as an answer."""
+    import app.api.routes.chat as chat_routes
+
+    monkeypatch.setattr(chat_routes, "ask_stream", fake_rejecting_stream)
+    _set_gating(monkeypatch, True)
+    session_id = _events(signed_in)[0]["session_id"]
+
+    resp = signed_in.get(f"/api/v1/chat/sessions/{session_id}")
+    assert resp.status_code == 200
+    stored = [(m["role"], m["content"]) for m in resp.json()["messages"]]
+    assert stored == [("user", "what changed?"), ("assistant", "grounded answer")]
+    assert "ungrounded draft" not in stored[1][1]
