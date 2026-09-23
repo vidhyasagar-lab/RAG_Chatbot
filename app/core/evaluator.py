@@ -322,8 +322,10 @@ def _evaluate_single_query_sync(
             # so /chat/scores and /feedback can be ownership checked.
             save_query_scores(trace_id, scores, user_id=user_id)
 
-            # Save to eval cache for future lookups (same question + contexts)
-            save_eval_cache(question, contexts, scores)
+            # Cache under the answer that was actually scored, so a later
+            # gate check on a different answer misses rather than inheriting
+            # this verdict.
+            save_eval_cache(question, contexts, scores, answer=answer)
 
             logger.info(
                 "per_query_eval_completed",
@@ -353,12 +355,9 @@ def evaluate_context_precision_sync(
     if not contexts:
         return None
 
-    # Check cache first
-    cached = get_eval_cache(question, contexts)
-    if cached and cached.get("context_precision") is not None:
-        logger.info("context_precision_cache_hit")
-        return cached["context_precision"]
-
+    # No cache read here. This metric runs concurrently with answer generation,
+    # so its latency is already hidden behind the LLM call and a hit would save
+    # nothing the reader can perceive.
     try:
         from ragas import evaluate
         from ragas.dataset_schema import SingleTurnSample, EvaluationDataset
@@ -404,8 +403,9 @@ def evaluate_faithfulness_sync(
     if not answer.strip() or not contexts:
         return None
 
-    # Check cache first
-    cached = get_eval_cache(question, contexts)
+    # Keyed on the answer too: this score describes THIS answer, and a
+    # question asked twice produces different answers at temperature > 0.
+    cached = get_eval_cache(question, contexts, answer)
     if cached and cached.get("faithfulness") is not None:
         logger.info("faithfulness_cache_hit")
         return cached["faithfulness"]

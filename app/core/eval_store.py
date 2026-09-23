@@ -335,19 +335,32 @@ def trace_belongs_to(trace_id: str, user_id: str) -> bool:
     return not owner or owner == user_id
 
 
-# ── Eval Cache (keyed by question + context hash) ────────────────────
+# ── Eval Cache (keyed by question + context + answer hash) ───────────
 
-def _make_cache_key(question: str, contexts: list[str]) -> str:
-    """Create a deterministic hash from question + contexts."""
+def _make_cache_key(question: str, contexts: list[str], answer: str = "") -> str:
+    """Create a deterministic hash from question + contexts + answer.
+
+    The answer belongs in the key because faithfulness measures the answer
+    against the contexts. Keying on question + contexts alone returns one
+    answer's score for a different answer to the same question, which is how
+    an ungrounded reply could inherit a passing verdict.
+
+    Answer-independent metrics (context_precision) pass ``answer=""`` and so
+    keep their own, shared row.
+    """
     import hashlib
-    normalised = question.strip().lower() + "||" + "||".join(c.strip() for c in sorted(contexts))
+    normalised = (
+        question.strip().lower()
+        + "||" + "||".join(c.strip() for c in sorted(contexts))
+        + "||" + answer.strip()
+    )
     return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:32]
 
 
-def get_eval_cache(question: str, contexts: list[str]) -> dict | None:
-    """Look up cached eval scores for this question + context combo."""
+def get_eval_cache(question: str, contexts: list[str], answer: str = "") -> dict | None:
+    """Look up cached eval scores for this question + context + answer combo."""
     conn = _get_conn()
-    key = _make_cache_key(question, contexts)
+    key = _make_cache_key(question, contexts, answer)
     row = conn.execute(
         "SELECT faithfulness, context_precision, answer_relevancy FROM eval_cache WHERE cache_key = ?",
         (key,),
@@ -358,10 +371,12 @@ def get_eval_cache(question: str, contexts: list[str]) -> dict | None:
     return None
 
 
-def save_eval_cache(question: str, contexts: list[str], scores: dict) -> None:
-    """Save eval scores to cache keyed by question + contexts."""
+def save_eval_cache(
+    question: str, contexts: list[str], scores: dict, answer: str = ""
+) -> None:
+    """Save eval scores to cache keyed by question + contexts + answer."""
     conn = _get_conn()
-    key = _make_cache_key(question, contexts)
+    key = _make_cache_key(question, contexts, answer)
     now = datetime.now(timezone.utc).isoformat()
     with _lock:
         conn.execute(
