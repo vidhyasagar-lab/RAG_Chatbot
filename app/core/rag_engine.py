@@ -414,6 +414,10 @@ Output only the result of step 4. Never print this reasoning.
   it rests on, so the step can be checked. Say them in plain words as part
   of the sentence - never tag a claim with a quoted label such as
   "(stated risk: ...)" or "(stated: ...)".
+- An explanation question - "why might", "how could", "what explains" -
+  keeps every reason the stated facts support, presented as what the facts
+  suggest. Do not open by saying the context does not explain it; say so
+  only if no stated fact supports any reason.
 - A short answer that is fully supported beats a fuller one that is not.
 - If what survives does not answer the question, say exactly that. An honest
   "the context does not cover this" is a correct answer here.

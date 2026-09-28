@@ -89,6 +89,15 @@ def test_an_explanation_is_offered_as_what_the_facts_suggest():
     assert "could outweigh" in SYSTEM_PROMPT
 
 
+def test_the_retry_prompt_answers_explanation_questions_from_the_facts():
+    """After a rejection the rewrite of "which risks could raise costs, and
+    why?" opened with "the context does not explain why" - the hedge the
+    answer prompt had already been cured of - and dropped two risks."""
+    lowered = REFINED_SYSTEM_PROMPT.lower()
+    assert "why might" in lowered
+    assert "do not open by saying the context does not explain" in lowered
+
+
 def test_the_retry_prompt_forbids_quoted_evidence_tags():
     """"Name the facts it rests on" came back as a "(stated risk: "...")" tag
     after every bullet - evidence quoted at the reader instead of used."""
