@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
 #: Minimum accepted length for SECRET_KEY. `secrets.token_urlsafe(32)` yields 43.
@@ -30,15 +30,18 @@ PLACEHOLDER_SECRETS = frozenset(
 class Settings(BaseSettings):
     """Centralised settings loaded from .env / environment."""
 
+    # Every credential is repr=False: pydantic prints all fields otherwise, and
+    # a failing test that touched this object once printed live keys.
+
     # Azure OpenAI
-    azure_openai_api_key: str
+    azure_openai_api_key: str = Field(repr=False)
     azure_openai_endpoint: str
     azure_openai_model: str = "gpt-5.2"
     azure_openai_api_version: str = "2025-01-01-preview"
     azure_openai_embedding_model: str = "text-embedding-ada-002"
 
     # Embedding-specific overrides (fall back to main Azure OpenAI values)
-    azure_openai_embedding_api_key: str = ""
+    azure_openai_embedding_api_key: str = Field("", repr=False)
     azure_openai_embedding_endpoint: str = ""
     azure_openai_embedding_api_version: str = ""
 
@@ -61,7 +64,7 @@ class Settings(BaseSettings):
     # evaluator. The seam is here so the choice can change by env var.
     eval_model: str = ""
     eval_endpoint: str = ""
-    eval_api_key: str = ""
+    eval_api_key: str = Field("", repr=False)
     eval_api_version: str = ""
 
     @property
@@ -85,7 +88,7 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8000
     log_level: str = "INFO"
-    api_key: str = ""  # Optional: set to require X-API-Key header on all requests
+    api_key: str = Field("", repr=False)  # Optional: set to require X-API-Key header on all requests
     # Per-IP request budget. Applies to everything except /api/v1/health
     # and /static/. Set rate_limit_enabled=false to disable entirely.
     rate_limit: str = "60/minute"
@@ -96,7 +99,7 @@ class Settings(BaseSettings):
     session_idle_minutes: int = 60
     # HMAC signing for session cookies. Required — must come from .env, with no
     # in-source default. Validated below.
-    secret_key: str
+    secret_key: str = Field(repr=False)
 
     @field_validator("secret_key")
     @classmethod
@@ -172,8 +175,8 @@ class Settings(BaseSettings):
 
     # Langfuse Observability
     langfuse_enabled: bool = True
-    langfuse_public_key: str = ""
-    langfuse_secret_key: str = ""
+    langfuse_public_key: str = Field("", repr=False)
+    langfuse_secret_key: str = Field("", repr=False)
     langfuse_host: str = "https://cloud.langfuse.com"
 
     @property
