@@ -11,7 +11,7 @@ import pickle
 import re
 from collections import defaultdict
 from pathlib import Path
-from threading import Lock
+from threading import Lock, RLock
 
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -26,6 +26,13 @@ logger = get_logger(__name__)
 
 _store: FAISS | None = None
 _lock = Lock()
+
+#: Held by every read of the indexes and every write to them. Searches run in
+#: worker threads while uploads and deletes run on the event loop, and neither
+#: FAISS (index updated before its id map) nor BM25 (delete resets, then
+#: re-adds) is safe to read mid-write. Embedding - the slow network call -
+#: always happens outside it.
+_index_lock = RLock()
 
 # ── Parent chunk cache (id → Document) ───────────────────────────────
 _parent_store: dict[str, Document] = {}
@@ -271,31 +278,39 @@ def add_documents(
         for doc in child_docs:
             doc.metadata["user_id"] = user_id
 
-    # Dense index (FAISS)
     store = get_vector_store()
-    ids = store.add_documents(child_docs)
+    texts = [d.page_content for d in child_docs]
+    vectors = store._embed_documents(texts) if texts else []
 
-    # Sparse index (BM25)
-    with _bm25_lock:
-        _get_bm25().add_documents(child_docs)
+    with _index_lock:
+        # Dense index (FAISS)
+        ids = store.add_embeddings(
+            list(zip(texts, vectors)),
+            metadatas=[d.metadata for d in child_docs],
+        ) if texts else []
 
-    # Parent chunks, kept for context expansion at retrieval time
-    if parent_docs:
-        for pdoc in parent_docs:
-            cid = pdoc.metadata.get("chunk_id", "")
-            if cid:
-                _parent_store[cid] = pdoc
+        # Sparse index (BM25)
+        with _bm25_lock:
+            _get_bm25().add_documents(child_docs)
 
-    # Image records by source
-    if image_records:
-        for rec in image_records:
-            source = rec.get("path", "")
-            if source:
-                _image_store.setdefault(source, []).append(rec)
+        # Parent chunks, kept for context expansion at retrieval time
+        if parent_docs:
+            for pdoc in parent_docs:
+                cid = pdoc.metadata.get("chunk_id", "")
+                if cid:
+                    _parent_store[cid] = pdoc
 
-    # Persist last, once every structure is updated — saving earlier would
-    # write a sidecar missing this document's BM25 entry and parent chunks.
-    _save_store()
+        # Image records by source
+        if image_records:
+            for rec in image_records:
+                source = rec.get("path", "")
+                if source:
+                    _image_store.setdefault(source, []).append(rec)
+
+        # Persist last, once every structure is updated — saving earlier would
+        # write a sidecar missing this document's BM25 entry and parent chunks.
+        # Under the lock: it pickles the same dicts a delete would be pruning.
+        _save_store()
 
     logger.info(
         "documents_indexed",
@@ -348,13 +363,15 @@ def hybrid_search(
     k = k or settings.top_k_results
     fetch_k = k * 3  # over-fetch before fusion
 
-    # 1. Dense retrieval (embedding similarity)
     store = get_vector_store()
-    dense_results = store.similarity_search(query, k=fetch_k)
+    query_vector = store._embed_query(query)  # network call: outside the lock
 
-    # 2. Sparse retrieval (BM25 keyword)
-    bm25 = _get_bm25()
-    sparse_raw = bm25.search(query, k=fetch_k)
+    with _index_lock:
+        # 1. Dense retrieval (embedding similarity)
+        dense_results = store.similarity_search_by_vector(query_vector, k=fetch_k)
+
+        # 2. Sparse retrieval (BM25 keyword)
+        sparse_raw = _get_bm25().search(query, k=fetch_k)
     sparse_results = [doc for doc, _score in sparse_raw]
 
     # Filter by user_id if provided
@@ -374,8 +391,9 @@ def hybrid_search(
         seen_parents: set[str] = set()
         for doc in fused:
             pid = doc.metadata.get("parent_id", "")
-            if pid and pid in _parent_store and pid not in seen_parents:
-                parent = _parent_store[pid]
+            with _index_lock:
+                parent = _parent_store.get(pid) if pid else None
+            if parent is not None and pid not in seen_parents:
                 # carry child metadata for source attribution
                 parent.metadata.setdefault("source", doc.metadata.get("source", ""))
                 parent.metadata.setdefault("page", doc.metadata.get("page", ""))
@@ -424,52 +442,53 @@ def delete_documents_by_source(filename: str, user_id: str = "") -> int:
 
     Returns the number of FAISS vectors removed.
     """
-    store = get_vector_store()
+    with _index_lock:
+        store = get_vector_store()
 
-    # 1. Find matching FAISS doc IDs
-    ids_to_delete: list[str] = []
-    for doc_id, doc in store.docstore._dict.items():
-        meta = doc.metadata if hasattr(doc, "metadata") else {}
-        src = meta.get("source", "")
-        uid = meta.get("user_id", "")
-        if not src.endswith(filename):
-            continue
-        if user_id and uid != user_id:
-            continue
-        ids_to_delete.append(doc_id)
+        # 1. Find matching FAISS doc IDs
+        ids_to_delete: list[str] = []
+        for doc_id, doc in store.docstore._dict.items():
+            meta = doc.metadata if hasattr(doc, "metadata") else {}
+            src = meta.get("source", "")
+            uid = meta.get("user_id", "")
+            if not src.endswith(filename):
+                continue
+            if user_id and uid != user_id:
+                continue
+            ids_to_delete.append(doc_id)
 
-    if ids_to_delete:
-        store.delete(ids_to_delete)
+        if ids_to_delete:
+            store.delete(ids_to_delete)
 
-    # 2. Rebuild BM25 without the deleted docs
-    with _bm25_lock:
-        remaining = [
-            d for d in _bm25.docs
-            if not (d.metadata.get("source", "").endswith(filename)
-                    and (not user_id or d.metadata.get("user_id", "") == user_id))
+        # 2. Rebuild BM25 without the deleted docs
+        with _bm25_lock:
+            remaining = [
+                d for d in _bm25.docs
+                if not (d.metadata.get("source", "").endswith(filename)
+                        and (not user_id or d.metadata.get("user_id", "") == user_id))
+            ]
+            _bm25.__init__()  # reset
+            if remaining:
+                _bm25.add_documents(remaining)
+
+        # 3. Remove matching parent chunks
+        parent_ids_to_remove = [
+            cid for cid, pdoc in _parent_store.items()
+            if pdoc.metadata.get("source", "").endswith(filename)
         ]
-        _bm25.__init__()  # reset
-        if remaining:
-            _bm25.add_documents(remaining)
+        for cid in parent_ids_to_remove:
+            _parent_store.pop(cid, None)
 
-    # 3. Remove matching parent chunks
-    parent_ids_to_remove = [
-        cid for cid, pdoc in _parent_store.items()
-        if pdoc.metadata.get("source", "").endswith(filename)
-    ]
-    for cid in parent_ids_to_remove:
-        _parent_store.pop(cid, None)
+        # 4. Remove matching image records
+        img_keys_to_remove = [
+            key for key in _image_store if key.endswith(filename)
+        ]
+        for key in img_keys_to_remove:
+            _image_store.pop(key, None)
 
-    # 4. Remove matching image records
-    img_keys_to_remove = [
-        key for key in _image_store if key.endswith(filename)
-    ]
-    for key in img_keys_to_remove:
-        _image_store.pop(key, None)
-
-    # Persist after every structure has been pruned, so a restart cannot
-    # resurrect the deleted document's BM25 entries or parent chunks.
-    _save_store()
+        # Persist after every structure has been pruned, so a restart cannot
+        # resurrect the deleted document's BM25 entries or parent chunks.
+        _save_store()
 
     logger.info("documents_deleted_by_source", filename=filename, user_id=user_id, removed=len(ids_to_delete))
     return len(ids_to_delete)
