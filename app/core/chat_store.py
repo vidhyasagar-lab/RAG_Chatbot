@@ -154,6 +154,40 @@ def get_session_messages(session_id: str) -> list[dict[str, Any]]:
     return messages
 
 
+def revise_answer_message(trace_id: str, revised: str | None, eval_meta: dict[str, Any]) -> bool:
+    """Record the quality gate's verdict on a stored answer, found by trace id.
+
+    The gate finishes after the answer was stored. When it rejected the draft
+    and produced a better one, the stored text is replaced so a reopened chat
+    and the next question's history both see the answer that survived.
+    Returns False when no stored answer carries the trace id.
+    """
+    conn = _get_conn()
+    needle = json.dumps({"trace_id": trace_id})[1:-1]  # '"trace_id": "..."'
+    with _lock:
+        rows = conn.execute(
+            "SELECT message_id, content, meta FROM chat_messages "
+            "WHERE role = 'assistant' AND meta LIKE ?",
+            (f"%{needle}%",),
+        ).fetchall()
+        for row in rows:
+            try:
+                meta = json.loads(row["meta"])
+            except ValueError:
+                continue
+            if meta.get("trace_id") != trace_id:
+                continue
+            meta["eval"] = eval_meta
+            conn.execute(
+                "UPDATE chat_messages SET content = ?, meta = ? WHERE message_id = ?",
+                (revised if revised is not None else row["content"], json.dumps(meta),
+                 row["message_id"]),
+            )
+            conn.commit()
+            return True
+    return False
+
+
 def get_recent_messages(session_id: str, limit: int = 20) -> list[dict[str, Any]]:
     """Return the last N messages for building chat context."""
     conn = _get_conn()

@@ -16,7 +16,7 @@ from app.core.chat_store import (
     get_user_sessions,
     update_session_title,
 )
-from app.core.eval_store import get_query_scores
+from app.core.eval_store import get_gate_result, get_query_scores
 from app.core.logging import get_logger
 from app.core.quota import check_exchange_quota, is_exempt
 from app.core.user_store import increment_exchanges
@@ -201,9 +201,23 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
             return
         saved = True
         meta = dict(context)
+        content = answers[chosen]
         if chosen in verdicts:
             meta["eval"] = verdicts[chosen]
-        add_message(session_id, "assistant", answers[chosen], meta=meta or None)
+        # The gate runs after `done` and updates this message when it finishes.
+        # If it finished first, there was no message to update: apply it here.
+        early = get_gate_result(meta.get("trace_id") or "", current_user["user_id"])
+        if early:
+            content = early["revised_answer"] or content
+            meta["eval"] = {
+                "faithfulness": early["faithfulness"],
+                "context_precision": early["context_precision"],
+                "threshold": early["threshold"],
+                "passed": early["verdict"] == "passed",
+                "verdict": early["verdict"],
+                "attempt": 2 if early["revised_answer"] else 1,
+            }
+        add_message(session_id, "assistant", content, meta=meta or None)
         # Charged here rather than at the start, so the budget tracks answers
         # the reader actually received: a request that dies before producing
         # text costs nothing, and one they read in full is charged even if
@@ -308,6 +322,22 @@ async def remove_session(session_id: str, current_user: dict = Depends(require_a
         raise HTTPException(status_code=403, detail="Not authorised")
     delete_session(session_id)
     return {"ok": True}
+
+
+@router.get("/gate/{trace_id}")
+async def get_gate(
+    trace_id: str,
+    current_user: dict = Depends(require_authenticated_user),
+):
+    """Poll the quality gate's verdict for an answer. 204 until it finishes.
+
+    The gate runs after the answer has streamed; when it rejected the draft,
+    `revised_answer` holds the replacement. Someone else's trace reads as 204.
+    """
+    result = get_gate_result(trace_id, current_user["user_id"])
+    if result is None:
+        return Response(status_code=204)
+    return result
 
 
 @router.get("/scores/{trace_id}")

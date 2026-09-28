@@ -76,6 +76,17 @@ def _init_tables(conn: sqlite3.Connection) -> None:
             created_at  TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS gate_results (
+            trace_id        TEXT PRIMARY KEY,
+            user_id         TEXT NOT NULL,
+            verdict         TEXT NOT NULL,
+            faithfulness    REAL,
+            context_precision REAL,
+            threshold       REAL NOT NULL,
+            revised_answer  TEXT,
+            created_at      TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS eval_cache (
             cache_key   TEXT PRIMARY KEY,
             question    TEXT NOT NULL,
@@ -308,6 +319,37 @@ def get_query_scores(trace_id: str, user_id: str | None = None) -> dict | None:
         if owner and owner != user_id:
             return None
     return record
+
+
+# ── Quality-gate results ─────────────────────────────────────────────
+#
+# The gate runs after the answer has streamed, so its verdict - and the
+# revised answer, when it rejected the draft - is stored here and polled.
+
+_GATE_FIELDS = ("verdict", "faithfulness", "context_precision", "threshold", "revised_answer")
+
+
+def save_gate_result(trace_id: str, user_id: str, result: dict) -> None:
+    conn = _get_conn()
+    now = datetime.now(timezone.utc).isoformat()
+    with _lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO gate_results "
+            "(trace_id, user_id, verdict, faithfulness, context_precision, threshold, "
+            "revised_answer, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (trace_id, user_id, *(result.get(k) for k in _GATE_FIELDS), now),
+        )
+        conn.commit()
+
+
+def get_gate_result(trace_id: str, user_id: str) -> dict | None:
+    """The gate's result for the owner, or None - pending and "not yours"
+    read the same, so trace ids cannot be probed."""
+    row = _get_conn().execute(
+        "SELECT * FROM gate_results WHERE trace_id = ? AND user_id = ?",
+        (trace_id, user_id),
+    ).fetchone()
+    return {k: row[k] for k in _GATE_FIELDS} if row else None
 
 
 def trace_belongs_to(trace_id: str, user_id: str) -> bool:

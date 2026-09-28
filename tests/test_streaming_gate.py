@@ -6,6 +6,11 @@ the finished string into 4-character "tokens". The gate itself cannot be made
 faster - gpt-5.2 needs ~24s for the faithfulness metric and a smaller model
 needs more - so the fix is to stop it blocking.
 
+It used to run inside the stream, after the answer. Everything below the
+answer - sources, figures, the next question - waited for `done`, which the
+gate held for ~36s. It now runs as a background task after `done`, and its
+verdict (and any revised answer) is fetched from /chat/gate/{trace_id}.
+
 Azure is stubbed at two boundaries: the streaming client and the two
 evaluator functions. Nothing here reaches the network.
 """
@@ -117,11 +122,30 @@ def _install(
         lambda question, contexts, answer: context_precision,
     )
     monkeypatch.setattr(engine, "evaluate_query_async", lambda **kw: None)
+    monkeypatch.setattr(engine, "create_trace", lambda **kw: _Recorded([], "trace"))
+    _saved(monkeypatch)
     return client
 
 
+def _saved(monkeypatch) -> dict:
+    """Capture what the background gate persists, instead of writing SQLite."""
+    saved = {"results": [], "revisions": []}
+    monkeypatch.setattr(engine, "save_gate_result",
+                        lambda trace_id, user_id, result: saved["results"].append(result))
+    monkeypatch.setattr(
+        engine, "revise_answer_message",
+        lambda trace_id, revised, eval_meta: saved["revisions"].append(
+            (trace_id, revised, eval_meta["verdict"])),
+    )
+    return saved
+
+
 def _collect(gated=True, **kw):
-    """Drive the async generator to completion and return parsed events."""
+    """Drive the stream to `done`, then let the background gate finish.
+
+    asyncio.run cancels whatever is still pending when its coroutine returns,
+    so the gate tasks are awaited inside it.
+    """
     async def run():
         out = []
         async for chunk in engine.ask_stream(
@@ -129,6 +153,7 @@ def _collect(gated=True, **kw):
         ):
             assert chunk.startswith("data: "), chunk
             out.append(json.loads(chunk[6:]))
+        await engine.wait_for_gates()
         return out
 
     return asyncio.run(run())
@@ -144,15 +169,42 @@ def _text(events, attempt):
     )
 
 
+def _gate(saved) -> dict:
+    assert len(saved["results"]) == 1, saved["results"]
+    return saved["results"][0]
+
+
 # ── the core claim ───────────────────────────────────────────────────
 
-def test_a_token_arrives_before_any_eval_event(monkeypatch):
-    """The whole point: the reader is not held behind the gate."""
+def test_the_stream_ends_with_the_answer_not_the_gate(monkeypatch):
+    """Sources, figures and the next question all wait for `done`. With the
+    gate inside the stream that was ~36s after the answer; now it is none."""
     _install(monkeypatch)
-    types = _types(_collect())
+    events = _collect()
 
-    assert "token" in types and "eval" in types
-    assert types.index("token") < types.index("eval")
+    types = _types(events)
+    assert "eval" not in types and "replace" not in types
+    assert types[-1] == "done"
+    assert events[-1]["gate"] == "pending"
+    assert events[-1]["final_attempt"] == 1
+
+
+def test_done_does_not_wait_for_a_slow_gate(monkeypatch):
+    import time
+
+    _install(monkeypatch)
+    monkeypatch.setattr(engine, "evaluate_faithfulness_sync",
+                        lambda question, answer, contexts: time.sleep(1.0) or 0.9)
+
+    async def run():
+        start = time.perf_counter()
+        async for chunk in engine.ask_stream(question="q", user_id="u", session_id="s", gated=True):
+            if json.loads(chunk[6:])["type"] == "done":
+                elapsed = time.perf_counter() - start
+        await engine.wait_for_gates()
+        return elapsed
+
+    assert asyncio.run(run()) < 0.5
 
 
 def test_meta_precedes_the_first_token(monkeypatch):
@@ -162,92 +214,98 @@ def test_meta_precedes_the_first_token(monkeypatch):
     assert types.index("meta") < types.index("token")
 
 
-# ── gate outcomes ────────────────────────────────────────────────────
+# ── gate outcomes, now reported after the stream ─────────────────────
 
-def test_a_failing_gate_replaces_the_draft(monkeypatch):
+def test_a_failing_gate_produces_a_revised_answer(monkeypatch):
     _install(monkeypatch, answers=(["bad draft"], ["grounded answer"]),
              faithfulness=0.2, context_precision=0.8)
+    saved = _saved(monkeypatch)
     events = _collect()
 
-    assert "replace" in _types(events)
     assert _text(events, 1) == "bad draft"
-    assert _text(events, 2) == "grounded answer"
-    assert events[-1]["type"] == "done"
-    assert events[-1]["final_attempt"] == 2
+    assert _gate(saved)["verdict"] == "rejected"
+    assert _gate(saved)["revised_answer"] == "grounded answer"
+    assert saved["revisions"] == [("trace-x", "grounded answer", "rejected")]
 
 
 def test_a_passing_gate_leaves_one_attempt(monkeypatch):
     client = _install(monkeypatch, faithfulness=0.9, context_precision=0.8)
-    events = _collect()
+    saved = _saved(monkeypatch)
+    _collect()
 
-    assert "replace" not in _types(events)
-    assert events[-1]["final_attempt"] == 1
+    assert _gate(saved)["verdict"] == "passed"
+    assert _gate(saved)["revised_answer"] is None
     assert client.chat.completions.calls == 1, "regenerated despite passing"
 
 
 def test_zero_context_precision_does_not_regenerate(monkeypatch):
-    """Measured: this path cost ~94s and could not have helped.
-
-    A stricter prompt against identical, irrelevant context cannot raise
-    grounding. Report the retrieval failure instead of retrying.
-    """
+    """Measured: this path cost ~94s and could not have helped."""
     client = _install(monkeypatch, faithfulness=0.2, context_precision=0.0)
-    events = _collect()
+    saved = _saved(monkeypatch)
+    _collect()
 
-    verdicts = [e["verdict"] for e in events if e["type"] == "eval"]
-    assert verdicts == ["retrieval_failed"]
-    assert "replace" not in _types(events)
+    assert _gate(saved)["verdict"] == "retrieval_failed"
     assert client.chat.completions.calls == 1
 
 
 def test_unknown_context_precision_is_not_treated_as_retrieval_failure(monkeypatch):
     """None means the metric errored; 0.0 means retrieval genuinely missed."""
     _install(monkeypatch, faithfulness=0.2, context_precision=None)
-    events = _collect()
+    saved = _saved(monkeypatch)
+    _collect()
 
-    verdicts = [e["verdict"] for e in events if e["type"] == "eval"]
-    assert verdicts[0] == "rejected"
-    assert "replace" in _types(events)
+    assert _gate(saved)["verdict"] == "rejected"
 
 
 def test_a_raising_gate_keeps_the_draft(monkeypatch):
     """An evaluation failure must never cost the reader their answer."""
     _install(monkeypatch, answers=(["the draft"],),
              faithfulness=RuntimeError("ragas exploded"))
+    saved = _saved(monkeypatch)
     events = _collect()
 
-    assert [e["verdict"] for e in events if e["type"] == "eval"] == ["unscored"]
+    assert _gate(saved)["verdict"] == "unscored"
+    assert _gate(saved)["revised_answer"] is None
     assert _text(events, 1) == "the draft"
-    assert events[-1]["final_attempt"] == 1
+
+
+def test_a_crashing_gate_still_reports_a_result(monkeypatch):
+    """The badge polls for a result; without one it spins until it gives up."""
+    _install(monkeypatch)
+    saved = _saved(monkeypatch)
+
+    def boom(*a, **kw):
+        raise RuntimeError("verdict logic broke")
+
+    monkeypatch.setattr(engine, "_decide_verdict", boom)
+    _collect()
+
+    assert _gate(saved)["verdict"] == "unscored"
 
 
 def test_a_slow_precision_metric_does_not_discard_a_finished_faithfulness(monkeypatch):
-    """Precision makes one judge call per context - twelve now, not five - so
-    it is the metric that overruns. The timeout used to cancel both and call
-    the answer unscored, though faithfulness had finished long before."""
+    """Precision makes one judge call per context, so it is the metric that
+    overruns. A finished faithfulness score must survive its timeout."""
     import time
 
     from app.config import get_settings
 
     _install(monkeypatch, faithfulness=0.9)
+    saved = _saved(monkeypatch)
     monkeypatch.setattr(engine, "evaluate_context_precision_sync",
                         lambda question, contexts, answer: time.sleep(1.5) or 0.8)
     monkeypatch.setattr(get_settings(), "eval_timeout_seconds", 0.3)
+    _collect()
 
-    evals = [e for e in _collect() if e["type"] == "eval"]
-
-    assert evals[0]["verdict"] == "passed"
-    assert evals[0]["scores"]["faithfulness"] == 0.9
-    assert evals[0]["scores"]["context_precision"] is None
+    assert _gate(saved)["verdict"] == "passed"
+    assert _gate(saved)["faithfulness"] == 0.9
+    assert _gate(saved)["context_precision"] is None
 
 
-def test_the_regenerated_answer_is_not_scored_before_done(monkeypatch):
-    """The uninstrumented ~74s second faithfulness call is gone."""
+def test_the_regenerated_answer_is_not_gated_again(monkeypatch):
     calls = []
-
-    client = _install(monkeypatch, answers=(["bad"], ["better"]),
-                      faithfulness=0.2, context_precision=0.8)
-
+    _install(monkeypatch, answers=(["bad"], ["better"]),
+             faithfulness=0.2, context_precision=0.8)
     original = engine.evaluate_faithfulness_sync
 
     def counting(question, answer, contexts):
@@ -260,17 +318,51 @@ def test_the_regenerated_answer_is_not_scored_before_done(monkeypatch):
     assert calls == ["bad"], f"gate ran on the replacement too: {calls}"
 
 
+def test_the_final_answer_is_scored_in_the_background(monkeypatch):
+    _install(monkeypatch, answers=(["bad"], ["better"]),
+             faithfulness=0.2, context_precision=0.8)
+    scored = []
+    monkeypatch.setattr(engine, "evaluate_query_async", lambda **kw: scored.append(kw["answer"]))
+    _collect()
+
+    assert scored == ["better"]
+
+
+def test_an_empty_regeneration_does_not_destroy_the_answer(monkeypatch):
+    """A content filter or an empty completion must not replace a usable draft."""
+    _install(monkeypatch, answers=(["a usable draft"], [""]),
+             faithfulness=0.2, context_precision=0.8)
+    saved = _saved(monkeypatch)
+    _collect()
+
+    assert _gate(saved)["revised_answer"] is None
+    assert saved["revisions"] == [("trace-x", None, "rejected")]
+
+
+def test_context_precision_is_scored_against_the_real_answer(monkeypatch):
+    """"Without reference" means without a ground truth, not without the answer."""
+    seen = {}
+    _install(monkeypatch, answers=(["the streamed answer"],))
+    monkeypatch.setattr(
+        engine, "evaluate_context_precision_sync",
+        lambda question, contexts, answer: seen.update(answer=answer) or 0.8,
+    )
+    _collect()
+
+    assert seen.get("answer") == "the streamed answer"
+
+
 # ── gating disabled ──────────────────────────────────────────────────
 
 def test_gating_off_streams_without_evaluating(monkeypatch):
     _install(monkeypatch)
+    saved = _saved(monkeypatch)
     events = _collect(gated=False)
 
-    types = _types(events)
-    assert "eval" not in types
-    assert "replace" not in types
-    assert types[0] == "meta"
-    assert types[-1] == "done"
+    assert _types(events)[0] == "meta"
+    assert _types(events)[-1] == "done"
+    assert "gate" not in events[-1]
+    assert saved["results"] == []
     assert _text(events, 1) == "draft "
 
 
@@ -285,48 +377,9 @@ def test_gating_off_still_scores_the_answer_in_the_background(monkeypatch):
     assert scored[0]["answer"] == "draft "
 
 
-def test_context_precision_is_scored_against_the_real_answer(monkeypatch):
-    """LLMContextPrecisionWithoutReference judges contexts AGAINST the response.
-
-    "Without reference" means without a ground-truth answer - it uses the
-    actual one instead, and declares `response` a required column. Passing a
-    placeholder asks whether each context helped produce the text
-    "placeholder", which is always no, pinning the score at 0.0 for every
-    query. That in turn routes every rejection to `retrieval_failed` and
-    disables regeneration entirely.
-    """
-    seen = {}
-
-    _install(monkeypatch, answers=(["the streamed answer"],))
-    monkeypatch.setattr(
-        engine, "evaluate_context_precision_sync",
-        lambda question, contexts, answer: seen.update(answer=answer) or 0.8,
-    )
-    _collect()
-
-    assert seen.get("answer") == "the streamed answer"
-
-
-def test_an_empty_regeneration_does_not_destroy_the_answer(monkeypatch):
-    """Attempt 2 can come back empty - a content filter, an empty completion.
-
-    Switching to it unconditionally leaves the reader with a rejection notice
-    and nothing else, and throws away a draft that was at least readable.
-    """
-    _install(monkeypatch, answers=(["a usable draft"], [""]),
-             faithfulness=0.2, context_precision=0.8)
-    events = _collect()
-
-    assert events[-1]["final_attempt"] == 1, "switched to an empty attempt 2"
-    assert _text(events, 1) == "a usable draft"
-
+# ── plumbing ─────────────────────────────────────────────────────────
 
 def test_usage_is_requested_and_reported(monkeypatch):
-    """Azure only attaches usage to a stream when asked, via stream_options.
-
-    Without it every generation span reports zero tokens, so Langfuse shows
-    no cost for any answer.
-    """
     client = _install(monkeypatch)
     events = _collect()
 
@@ -334,20 +387,18 @@ def test_usage_is_requested_and_reported(monkeypatch):
     assert events[-1]["usage"].get("total_tokens") == 120
 
 
-def test_the_answer_stream_is_closed(monkeypatch):
-    """An unclosed stream leaves the HTTP response to Azure open."""
-    client = _install(monkeypatch)
+def test_every_answer_stream_is_closed(monkeypatch):
+    """An unclosed stream leaves the HTTP response to Azure open - including
+    the regeneration, which is now read in the background."""
+    client = _install(monkeypatch, answers=(["bad"], ["better"]),
+                      faithfulness=0.2, context_precision=0.8)
     _collect()
 
+    assert len(client.chat.completions.streams) == 2
     assert all(s.closed for s in client.chat.completions.streams)
 
 
 def test_a_long_answer_is_cut_on_a_boundary_not_mid_word(monkeypatch):
-    """Scoring a mid-word fragment invents an unverifiable claim.
-
-    ragas decomposes the dangling fragment, faithfulness drops, and a
-    complete correct answer gets rejected because of where the cut landed.
-    """
     seen = {}
     long_answer = ("The ingest pipeline reads each document. " * 400)  # ~16k chars
 
@@ -362,13 +413,10 @@ def test_a_long_answer_is_cut_on_a_boundary_not_mid_word(monkeypatch):
 
     scored = seen["scored"]
     assert len(scored) <= 6000
-    assert scored.endswith(" ") or scored.endswith(".") or scored == long_answer, (
-        f"cut mid-word: ...{scored[-40:]!r}"
-    )
+    assert scored.endswith(" ") or scored.endswith(".") or scored == long_answer
 
 
 def test_the_async_client_is_reused_across_requests():
-    """A fresh AsyncAzureOpenAI per request leaks an httpx pool per request."""
     engine._reset_async_client()
     try:
         assert engine._get_async_client() is engine._get_async_client()
@@ -377,13 +425,6 @@ def test_the_async_client_is_reused_across_requests():
 
 
 def test_the_gate_does_not_run_on_the_default_thread_pool():
-    """asyncio.to_thread uses the loop's default executor, sized min(32, cpu+4).
-
-    On the 1 vCPU box that is 5 workers. A gate cannot be cancelled, so a
-    timed-out one keeps its worker; enough of them would starve every other
-    to_thread caller in the process. The gate gets its own pool so the damage
-    cannot spread beyond the gate.
-    """
     assert engine._EVAL_EXECUTOR is not None
     assert engine._EVAL_EXECUTOR._max_workers >= 2
 
@@ -391,6 +432,7 @@ def test_the_gate_does_not_run_on_the_default_thread_pool():
 def test_concurrent_gated_requests_both_complete(monkeypatch):
     """The concurrency bound must not deadlock two simultaneous readers."""
     _install(monkeypatch)
+    saved = _saved(monkeypatch)
 
     async def run_two():
         async def one():
@@ -399,20 +441,23 @@ def test_concurrent_gated_requests_both_complete(monkeypatch):
                 async for c in engine.ask_stream(question="q", user_id="u",
                                                  session_id="s", gated=True)
             ]
-        return await asyncio.gather(one(), one())
+        results = await asyncio.gather(one(), one())
+        await engine.wait_for_gates()
+        return results
 
     first, second = asyncio.run(run_two())
     assert first[-1]["type"] == "done"
     assert second[-1]["type"] == "done"
+    assert len(saved["results"]) == 2
 
 
-# ── the reader leaves mid-pipeline ───────────────────────────────────
+# ── spans and the trace are always closed ────────────────────────────
 
 class _Recorded:
     """A trace or span that remembers whether it was ended."""
 
     def __init__(self, log: list, name: str):
-        self.name, self.ended, self.id, self._log = name, False, "trace-1", log
+        self.name, self.ended, self.id, self._log = name, False, "trace-x", log
         log.append(self)
 
     def span(self, **kw): return _Recorded(self._log, kw.get("name", "?"))
@@ -421,46 +466,64 @@ class _Recorded:
     def end(self, **kw): self.ended = True
 
 
-def _leave_when(monkeypatch, stop) -> list[_Recorded]:
-    """Read events until `stop(event)` is true, then close the stream the way
-    Starlette does when the client disconnects."""
+def _recording(monkeypatch) -> list[_Recorded]:
     opened: list[_Recorded] = []
     monkeypatch.setattr(engine, "create_trace", lambda **kw: _Recorded(opened, "trace"))
+    return opened
+
+
+def test_leaving_while_the_draft_streams_closes_everything(monkeypatch):
+    """An unended span shows in Langfuse as a request still running, forever."""
+    _install(monkeypatch, answers=(["bad"], ["better"]),
+             faithfulness=0.2, context_precision=0.8)
+    opened = _recording(monkeypatch)
 
     async def run():
         agen = engine.ask_stream(question="q", user_id="u", session_id="s", gated=True)
         async for chunk in agen:
-            if stop(json.loads(chunk[6:])):
+            if json.loads(chunk[6:])["type"] == "token":
                 break
         await agen.aclose()
+        await engine.wait_for_gates()
 
     asyncio.run(run())
-    return opened
+    assert [o.name for o in opened if not o.ended] == []
 
 
-@pytest.mark.parametrize("where, stop", [
-    ("while the draft streams", lambda e: e["type"] == "token" and e["attempt"] == 1),
-    ("while the gate scores", lambda e: e.get("stage") == "scoring"),
-    ("while the replacement streams", lambda e: e["type"] == "token" and e["attempt"] == 2),
-])
-def test_leaving_mid_pipeline_closes_every_span_and_the_trace(monkeypatch, where, stop):
-    """An unended span shows in Langfuse as a request still running, forever."""
-    _install(monkeypatch, answers=(["bad"], ["better"]),
-             faithfulness=0.2, context_precision=0.8)
-    opened = _leave_when(monkeypatch, stop)
-
-    left_open = [o.name for o in opened if not o.ended]
-    assert left_open == [], f"left open after leaving {where}: {left_open}"
-
-
-def test_leaving_mid_draft_does_not_start_a_replacement(monkeypatch):
-    """Nobody is there to read it."""
+def test_leaving_mid_draft_does_not_start_a_gate(monkeypatch):
+    """Nobody is there to read the result, and the draft was never finished."""
     client = _install(monkeypatch, answers=(["bad"], ["better"]),
                       faithfulness=0.2, context_precision=0.8)
-    _leave_when(monkeypatch, lambda e: e["type"] == "token" and e["attempt"] == 1)
+    saved = _saved(monkeypatch)
+    _recording(monkeypatch)
 
+    async def run():
+        agen = engine.ask_stream(question="q", user_id="u", session_id="s", gated=True)
+        async for chunk in agen:
+            if json.loads(chunk[6:])["type"] == "token":
+                break
+        await agen.aclose()
+        await engine.wait_for_gates()
+
+    asyncio.run(run())
     assert client.chat.completions.calls == 1
+    assert saved["results"] == []
 
+
+@pytest.mark.parametrize("outcome", [
+    dict(faithfulness=0.9, context_precision=0.8),          # passed
+    dict(faithfulness=0.2, context_precision=0.8),          # rejected, regenerated
+    dict(faithfulness=RuntimeError("x"), context_precision=0.8),  # unscored
+], ids=["passed", "rejected", "unscored"])
+def test_the_background_gate_closes_every_span_and_the_trace(monkeypatch, outcome):
+    _install(monkeypatch, answers=(["bad"], ["better"]), **outcome)
+    opened = _recording(monkeypatch)
+    _collect()
+
+    assert [o.name for o in opened if not o.ended] == []
+
+
+# ── follow-up search ─────────────────────────────────────────────────
 
 def test_a_second_search_is_announced_before_the_sources(monkeypatch):
     """The wait is explained, and the sources shown include round two's."""
@@ -478,9 +541,10 @@ def test_no_second_search_means_no_searching_stage(monkeypatch):
     assert all(e.get("stage") != "searching" for e in _collect())
 
 
-def test_stage_events_describe_the_phase(monkeypatch):
+def test_the_stream_only_announces_generation(monkeypatch):
+    """Scoring and regenerating happen after the stream now."""
     _install(monkeypatch, answers=(["bad"], ["better"]),
              faithfulness=0.2, context_precision=0.8)
     stages = [e["stage"] for e in _collect() if e["type"] == "stage"]
 
-    assert stages == ["generating", "scoring", "regenerating"]
+    assert stages == ["generating"]

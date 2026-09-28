@@ -17,7 +17,9 @@ from openai import AsyncAzureOpenAI, AzureOpenAI
 from langchain_core.documents import Document
 
 from app.config import get_settings
+from app.core.chat_store import revise_answer_message
 from app.core.document_loader import _token_len
+from app.core.eval_store import save_gate_result
 from app.core.evaluator import (
     evaluate_context_precision_sync,
     evaluate_faithfulness_sync,
@@ -548,6 +550,141 @@ def _usage_of(chunk) -> dict:
     }
 
 
+# Background gates still running. Held so they are not garbage collected
+# mid-flight, and so tests and shutdown can wait for them.
+_GATE_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_gate(**kwargs) -> None:
+    task = asyncio.create_task(_run_gate(**kwargs))
+    _GATE_TASKS.add(task)
+    task.add_done_callback(_GATE_TASKS.discard)
+
+
+async def wait_for_gates() -> None:
+    """Wait for every running gate. For tests and orderly shutdown."""
+    while _GATE_TASKS:
+        await asyncio.gather(*list(_GATE_TASKS), return_exceptions=True)
+
+
+async def _run_gate(*, trace, question: str, answer: str, context_text: str,
+                    context_chunks: list[str], chat_history: list[ChatMessage] | None,
+                    user_id: str, sources_count: int) -> None:
+    """Score a streamed answer, and rewrite it once if it is ungrounded.
+
+    Runs after the reader already has the answer. Whatever happens, a result
+    is saved - the badge polls for it - and the trace is closed.
+    """
+    settings = get_settings()
+    threshold = settings.eval_quality_threshold
+    result = {"verdict": VERDICT_UNSCORED, "faithfulness": None, "context_precision": None,
+              "threshold": threshold, "revised_answer": None}
+    final_answer, final_attempt = answer, 1
+    spans: list = []
+    try:
+        # Cost tracks claim count, which tracks answer length, so cap the
+        # input - but cut on a boundary. A mid-word cut leaves a dangling
+        # fragment that ragas decomposes into an unverifiable claim.
+        scored_text = _truncate_on_boundary(answer, settings.eval_max_answer_chars)
+        eval_span = trace.span(
+            name="quality-gate",
+            input={"answer_len": len(scored_text),
+                   "truncated": len(scored_text) < len(answer),
+                   "full_answer_len": len(answer)},
+        )
+        spans.append(eval_span)
+
+        # Both metrics need the answer; they overlap each other, so the gate
+        # costs max(faithfulness, precision). Each is kept or dropped on its
+        # own: on timeout a score that finished is kept even though the other
+        # is still running. Precision is the one that overruns - it makes a
+        # judge call per retrieved context.
+        faithfulness = context_precision = None
+        metrics: list[asyncio.Future] = []
+        try:
+            async with _EVAL_SLOTS:
+                metrics = [
+                    asyncio.ensure_future(_run_metric(
+                        evaluate_faithfulness_sync, question, scored_text, context_chunks)),
+                    asyncio.ensure_future(_run_metric(
+                        evaluate_context_precision_sync, question, context_chunks, scored_text)),
+                ]
+                _, late = await asyncio.wait(metrics, timeout=settings.eval_timeout_seconds)
+            if late:
+                logger.warning("eval_metric_timed_out", late=len(late), trace_id=trace.id)
+            faithfulness, context_precision = (_finished_result(m) for m in metrics)
+        finally:
+            # A metric's thread cannot be cancelled: a late ragas call runs to
+            # completion in its worker, abandoned rather than killed.
+            for metric in metrics:
+                if not metric.done():
+                    metric.cancel()
+
+        verdict = _decide_verdict(faithfulness, context_precision, threshold)
+        result.update(verdict=verdict, faithfulness=faithfulness,
+                      context_precision=context_precision)
+        eval_span.update(output=dict(result))
+        eval_span.end()
+        spans.remove(eval_span)
+
+        # A rewrite only when it could change the outcome.
+        if verdict == VERDICT_REJECTED and settings.eval_max_retries > 0:
+            logger.warning("faithfulness_gate_failed_regenerating",
+                           faithfulness=faithfulness, threshold=threshold, trace_id=trace.id)
+            refined = _build_messages(REFINED_SYSTEM_PROMPT, context_text, chat_history, question)
+            regen_span = trace.generation(
+                name="llm-completion-regenerated",
+                model=settings.azure_openai_model,
+                input=refined,
+                model_parameters={"max_tokens": settings.max_tokens,
+                                  "temperature": max(settings.temperature - 0.1, 0.0)},
+            )
+            spans.append(regen_span)
+            replacement: dict = {"text": "", "usage": {}}
+            async for _ in _stream_answer(_get_async_client(), refined, settings, 2, replacement):
+                pass
+            regen_span.update(output=replacement["text"], usage=replacement["usage"])
+            regen_span.end()
+            spans.remove(regen_span)
+
+            # Not gated again: it is scored in the background like every
+            # other answer. An empty rewrite (a content filter, an empty
+            # completion) must not replace a draft that was at least readable.
+            if replacement["text"].strip():
+                result["revised_answer"] = replacement["text"]
+                final_answer, final_attempt = replacement["text"], 2
+            else:
+                logger.warning("regeneration_empty_keeping_draft", trace_id=trace.id)
+        elif verdict == VERDICT_RETRIEVAL_FAILED:
+            logger.info("regeneration_skipped_retrieval_failed",
+                        faithfulness=faithfulness, trace_id=trace.id)
+    except Exception:
+        logger.exception("quality_gate_failed", trace_id=trace.id)
+    finally:
+        for span in spans:
+            span.end()
+        try:
+            save_gate_result(trace.id, user_id, result)
+            revise_answer_message(trace.id, result["revised_answer"], {
+                "faithfulness": result["faithfulness"],
+                "context_precision": result["context_precision"],
+                "threshold": threshold,
+                "passed": result["verdict"] == VERDICT_PASSED,
+                "verdict": result["verdict"],
+                "attempt": final_attempt,
+            })
+        except Exception:
+            logger.exception("gate_result_not_saved", trace_id=trace.id)
+        trace.update(output={"answer": final_answer, "sources_count": sources_count,
+                             "verdict": result["verdict"], "final_attempt": final_attempt})
+        trace.end()
+        logger.info("rag_gate_completed", verdict=result["verdict"],
+                    final_attempt=final_attempt, faithfulness=result["faithfulness"],
+                    context_precision=result["context_precision"], trace_id=trace.id)
+        evaluate_query_async(question=question, answer=final_answer, contexts=context_chunks,
+                             trace_id=trace.id, user_id=user_id)
+
+
 async def ask_stream(
     question: str,
     chat_history: list[ChatMessage] | None = None,
@@ -560,11 +697,13 @@ async def ask_stream(
 
     Event contract (see docs/superpowers/specs/2026-09-23-streaming-eval-gate-design.md):
 
-        meta → stage → token+ → [eval → [replace → stage → token+]] → done
+        [stage:searching] → meta → stage → token+ → done
 
-    The gate runs AFTER the answer has streamed. It cannot be made fast —
-    measured at ~24s for gpt-5.2 and ~44s for gpt-4.1-mini on the same
-    sample — so it runs where it costs the reader nothing.
+    With the gate on, `done` carries ``"gate": "pending"`` and the gate runs
+    as a background task after the stream (see ``_run_gate``). It cannot be
+    made fast - measured at ~24s for gpt-5.2 and ~44s for gpt-4.1-mini on the
+    same sample - so it runs where it costs the reader nothing, not even the
+    wait for the sources or the next question.
 
     ``gated=None`` defers to ``settings.eval_gating_enabled``.
     """
@@ -657,8 +796,6 @@ async def ask_stream(
         gen_span.update(output=answer, usage=usage)
         _close(gen_span)
 
-        final_answer, final_attempt = answer, 1
-
         if not gated:
             trace.update(output={"answer": answer, "sources_count": len(sources)})
             trace_id = trace.id
@@ -670,140 +807,19 @@ async def ask_stream(
             yield _sse({"type": "done", "usage": usage, "final_attempt": 1})
             return
 
-        # ── The gate ─────────────────────────────────────────────────
-        yield _sse({"type": "stage", "stage": "scoring", "attempt": 1})
-
-        # Cost tracks claim count, which tracks answer length, so cap the input -
-        # but cut on a boundary. A mid-word cut leaves a dangling fragment that
-        # ragas decomposes into an unverifiable claim, which can reject a complete,
-        # correct answer purely because of where the cut landed.
-        scored_text = _truncate_on_boundary(answer, settings.eval_max_answer_chars)
-        eval_span = _opened(trace.span(
-            name="quality-gate",
-            input={"answer_len": len(scored_text),
-                   "truncated": len(scored_text) < len(answer),
-                   "full_answer_len": len(answer)},
-        ))
-
-        # Both metrics need the answer, so neither can overlap generation. They do
-        # overlap each other: the gate costs max(faithfulness, precision) rather
-        # than their sum, and the whole thing is off the reader's path anyway.
-        #
-        # Each metric is kept or dropped on its own. On timeout, a score that
-        # finished at 20s is kept even though the other is still running;
-        # wait_for(gather(...)) cancelled both and threw it away. Precision is
-        # the one that overruns - it makes a judge call per retrieved context.
-        faithfulness = context_precision = None
-        metrics: list[asyncio.Future] = []
-        try:
-            async with _EVAL_SLOTS:
-                metrics = [
-                    asyncio.ensure_future(_run_metric(
-                        evaluate_faithfulness_sync, question, scored_text, context_chunks)),
-                    asyncio.ensure_future(_run_metric(
-                        evaluate_context_precision_sync, question, context_chunks, scored_text)),
-                ]
-                _, late = await asyncio.wait(metrics, timeout=settings.eval_timeout_seconds)
-            if late:
-                logger.warning("eval_metric_timed_out", late=len(late), trace_id=trace.id)
-            faithfulness, context_precision = (_finished_result(m) for m in metrics)
-        except Exception as exc:
-            # Deliberately NOT asyncio.CancelledError, which is a BaseException
-            # and means the reader disconnected - that should propagate.
-            #
-            # A gate that fails must never cost the reader the answer they can
-            # already see. Report it as unscored and keep the draft.
-            logger.warning("faithfulness_gate_unavailable",
-                           error=f"{type(exc).__name__}: {exc}", trace_id=trace.id)
-            faithfulness = None
-        finally:
-            # A metric's thread cannot be cancelled: a late ragas call runs to
-            # completion in its worker, abandoned rather than killed. Cancelling
-            # the future just stops anyone waiting on it.
-            for metric in metrics:
-                if not metric.done():
-                    metric.cancel()
-
-        threshold = settings.eval_quality_threshold
-        verdict = _decide_verdict(faithfulness, context_precision, threshold)
-        scores = {
-            "faithfulness": faithfulness,
-            "context_precision": context_precision,
-            "threshold": threshold,
-            "passed": verdict == VERDICT_PASSED,
-        }
-        eval_span.update(output={**scores, "verdict": verdict})
-        _close(eval_span)
-
-        yield _sse({"type": "eval", "attempt": 1, "verdict": verdict, "scores": scores})
-
-        # ── Attempt 2, only when regenerating could change the outcome ──
-        if verdict == VERDICT_REJECTED and settings.eval_max_retries > 0:
-            logger.warning("faithfulness_gate_failed_regenerating",
-                           faithfulness=faithfulness, threshold=threshold, trace_id=trace.id)
-            yield _sse({
-                "type": "replace",
-                "reason": f"faithfulness {faithfulness:.2f} < {threshold:.2f}",
-            })
-            yield _sse({"type": "stage", "stage": "regenerating", "attempt": 2})
-
-            refined = _build_messages(REFINED_SYSTEM_PROMPT, context_text, chat_history, question)
-            regen_span = _opened(trace.generation(
-                name="llm-completion-regenerated",
-                model=settings.azure_openai_model,
-                input=refined,
-                model_parameters={"max_tokens": settings.max_tokens,
-                                  "temperature": max(settings.temperature - 0.1, 0.0)},
-            ))
-            replacement: dict = {"text": "", "usage": {}}
-            async for event in _stream_answer(client, refined, settings, 2, replacement):
-                yield event
-            regen_answer = replacement["text"]
-            regen_usage = replacement["usage"]
-            regen_span.update(output=regen_answer, usage=regen_usage)
-            _close(regen_span)
-
-            # Deliberately NOT scored here. The old pipeline ran the metric a
-            # second time before returning, which cost ~74s of a 3m41s request
-            # and appeared in no Langfuse span. It is scored in the background
-            # below, like every other answer.
-            if not regen_answer.strip():
-                # A content filter or an empty completion. Switching to it would
-                # leave the reader with a rejection notice and nothing else, and
-                # throw away a draft that was at least readable.
-                logger.warning("regeneration_empty_keeping_draft", trace_id=trace.id)
-                yield _sse({
-                    "type": "eval", "attempt": 2, "verdict": VERDICT_UNSCORED,
-                    "scores": {"faithfulness": None, "context_precision": None,
-                               "threshold": threshold, "passed": False},
-                })
-                yield _sse({"type": "done", "usage": usage, "final_attempt": 1})
-                trace.update(output={"answer": answer, "sources_count": len(sources),
-                                     "verdict": verdict, "final_attempt": 1})
-                _close(trace)
-                return
-
-            final_answer, final_attempt = regen_answer, 2
-            usage = {k: usage.get(k, 0) + regen_usage.get(k, 0)
-                     for k in ("prompt_tokens", "completion_tokens", "total_tokens")}
-        elif verdict == VERDICT_RETRIEVAL_FAILED:
-            logger.info("regeneration_skipped_retrieval_failed",
-                        faithfulness=faithfulness, trace_id=trace.id)
-
-        trace.update(output={"answer": final_answer, "sources_count": len(sources),
-                             "verdict": verdict, "final_attempt": final_attempt})
-        trace_id = trace.id
-        _close(trace)
-
-        logger.info("rag_stream_gated_completed", question_len=len(question),
-                    context_chunks=len(sources), verdict=verdict,
-                    final_attempt=final_attempt, faithfulness=faithfulness,
-                    context_precision=context_precision, trace_id=trace_id)
-
-        evaluate_query_async(question=question, answer=final_answer, contexts=context_chunks,
-                             trace_id=trace_id, user_id=user_id)
-
-        yield _sse({"type": "done", "usage": usage, "final_attempt": final_attempt})
+        # ── The gate, after the stream ───────────────────────────────
+        # Everything under the answer - sources, figures, the next question -
+        # waits for `done`. With the gate inside the stream that was ~36s
+        # after the answer was readable. It runs as a background task instead,
+        # which owns the trace from here, and its verdict is polled from
+        # /chat/gate/{trace_id}.
+        still_open.remove(trace)
+        _spawn_gate(
+            trace=trace, question=question, answer=answer, context_text=context_text,
+            context_chunks=context_chunks, chat_history=chat_history, user_id=user_id,
+            sources_count=len(sources),
+        )
+        yield _sse({"type": "done", "usage": usage, "final_attempt": 1, "gate": "pending"})
     except BaseException:
         if trace in still_open:
             trace.update(output={"abandoned": True})
