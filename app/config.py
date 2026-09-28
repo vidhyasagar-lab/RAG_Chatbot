@@ -130,7 +130,10 @@ class Settings(BaseSettings):
     semantic_threshold: int = 85  # percentile for semantic boundary detection
 
     # RAG – Hybrid Retrieval
-    top_k_results: int = 5
+    top_k_results: int = 12
+    # Parent expansion lets 12 results reach ~6,000 tokens; the lowest-ranked
+    # are trimmed beyond this, but the top result is always kept.
+    max_context_tokens: int = 6000
     dense_weight: float = 0.5
     sparse_weight: float = 0.5
 

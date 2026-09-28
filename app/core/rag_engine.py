@@ -14,7 +14,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from openai import AsyncAzureOpenAI, AzureOpenAI
 
+from langchain_core.documents import Document
+
 from app.config import get_settings
+from app.core.document_loader import _token_len
 from app.core.evaluator import (
     evaluate_context_precision_sync,
     evaluate_faithfulness_sync,
@@ -159,6 +162,28 @@ def _build_context(query: str, top_k: int | None = None, user_id: str = "") -> t
     paths to visual elements referenced by retrieved chunks.
     """
     docs = hybrid_search(query, k=top_k, user_id=user_id)
+    return _format_context(_apply_budget(docs, get_settings().max_context_tokens))
+
+
+def _apply_budget(docs: list[Document], max_tokens: int) -> list[Document]:
+    """Keep results in rank order until the next would exceed the budget.
+
+    The top result is always kept: an oversized context is a cost, an empty
+    one is a wrong answer.
+    """
+    kept: list[Document] = []
+    used = 0
+    for doc in docs:
+        size = _token_len(doc.page_content)
+        if kept and used + size > max_tokens:
+            break
+        kept.append(doc)
+        used += size
+    return kept
+
+
+def _format_context(docs: list[Document]) -> tuple[str, list[dict], list[dict]]:
+    """Number the retrieved documents into one context block, with their sources."""
     sources: list[dict] = []
     images: list[dict] = []
     context_parts: list[str] = []
