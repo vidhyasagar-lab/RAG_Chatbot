@@ -6,7 +6,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.middleware import APIKeyMiddleware, RequestLoggingMiddleware, SecurityHeadersMiddleware, global_exception_handler
+from app.api.middleware import (
+    APIKeyMiddleware,
+    RequestLoggingMiddleware,
+    SecurityHeadersMiddleware,
+    SessionRefreshMiddleware,
+    global_exception_handler,
+)
 from app.api.rate_limit import RateLimitMiddleware
 from app.api.routes import auth, chat, documents, health, feedback
 from app.api.routes.admin import router as admin_router
@@ -97,6 +103,7 @@ def create_app() -> FastAPI:
     )
 
     # ── Custom middleware ─────────────────────────────────────────────
+    app.add_middleware(SessionRefreshMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(APIKeyMiddleware)
     app.add_middleware(RequestLoggingMiddleware)

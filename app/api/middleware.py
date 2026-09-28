@@ -85,6 +85,45 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class SessionRefreshMiddleware:
+    """Slide the idle window: re-sign a valid session cookie on each successful response.
+
+    Pure ASGI rather than BaseHTTPMiddleware so the chat's SSE stream passes
+    through untouched; only the response-start message is edited. Skipped when
+    the response fails (a 401 must not revive anything) and when the route
+    already sets the session cookie itself (login, logout).
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        from starlette.requests import cookie_parser
+
+        from app.core.auth import COOKIE_NAME, refreshed_session_cookie
+
+        raw = b"; ".join(v for k, v in scope.get("headers", []) if k == b"cookie").decode("latin-1")
+        token = cookie_parser(raw).get(COOKIE_NAME) if raw else None
+        fresh = refreshed_session_cookie(token) if token else None
+        if not fresh:
+            return await self.app(scope, receive, send)
+
+        prefix = f"{COOKIE_NAME}=".encode()
+
+        async def send_with_cookie(message):
+            if message["type"] == "http.response.start" and message["status"] < 400:
+                headers = list(message.get("headers", []))
+                if not any(k == b"set-cookie" and v.startswith(prefix) for k, v in headers):
+                    headers.append((b"set-cookie", fresh.encode("latin-1")))
+                    message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_cookie)
+
+
 # ── Paths that bypass API-key authentication ─────────────────────────
 # The unauthenticated entry points only. /auth/register sits alongside
 # /auth/login — omitting it meant enabling API_KEY silently broke signup but

@@ -90,6 +90,10 @@ class Settings(BaseSettings):
     # and /static/. Set rate_limit_enabled=false to disable entirely.
     rate_limit: str = "60/minute"
     rate_limit_enabled: bool = True
+    # Sign-in idle timeout. The session cookie lives this long after the last
+    # authenticated request and is re-signed by each one, so an active user
+    # stays in and an idle one is out this long after they stopped.
+    session_idle_minutes: int = 60
     # HMAC signing for session cookies. Required — must come from .env, with no
     # in-source default. Validated below.
     secret_key: str

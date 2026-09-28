@@ -17,8 +17,15 @@ logger = get_logger(__name__)
 
 # ── Signed cookie helpers ────────────────────────────────────────────
 
-_COOKIE_NAME = "user_id"
-_COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
+COOKIE_NAME = "user_id"
+# Re-sign at most this often: the timestamp only needs minute precision, and
+# re-signing on every request would put a Set-Cookie on every response.
+_REFRESH_AFTER_SECONDS = 60
+
+
+def idle_seconds() -> int:
+    """How long a session survives without an authenticated request."""
+    return max(1, get_settings().session_idle_minutes) * 60
 
 
 def _get_signer() -> URLSafeTimedSerializer:
@@ -31,10 +38,14 @@ def sign_user_id(user_id: str) -> str:
     return _get_signer().dumps(user_id)
 
 
-def unsign_user_id(token: str, max_age: int = _COOKIE_MAX_AGE) -> str | None:
-    """Verify and decode a signed token. Returns user_id or None."""
+def unsign_user_id(token: str, max_age: int | None = None) -> str | None:
+    """Verify and decode a signed token. Returns user_id or None.
+
+    ``max_age`` defaults to the idle timeout: the token's timestamp is when it
+    was last re-signed, so this rejects a session idle for longer than that.
+    """
     try:
-        return _get_signer().loads(token, max_age=max_age)
+        return _get_signer().loads(token, max_age=idle_seconds() if max_age is None else max_age)
     except BadSignature:
         # Tampered, forged, or expired — the ordinary rejection path.
         return None
@@ -50,13 +61,33 @@ def set_session_cookie(response: Response, user_id: str) -> None:
     settings = get_settings()
     is_dev = settings.app_env.lower() in ("development", "dev", "local")
     response.set_cookie(
-        key=_COOKIE_NAME,
+        key=COOKIE_NAME,
         value=sign_user_id(user_id),
         httponly=True,
         secure=not is_dev,
         samesite="lax",
-        max_age=_COOKIE_MAX_AGE,
+        max_age=idle_seconds(),
     )
+
+
+def refreshed_session_cookie(token: str) -> str | None:
+    """A Set-Cookie header value that restarts the idle window, or None.
+
+    None when the token is invalid or expired (nothing to extend) or was
+    signed under a minute ago (nothing worth extending yet).
+    """
+    try:
+        user_id, signed_at = _get_signer().loads(token, max_age=idle_seconds(), return_timestamp=True)
+    except BadSignature:
+        return None
+    except Exception:
+        logger.exception("session_token_unreadable")
+        return None
+    if time.time() - signed_at.timestamp() < _REFRESH_AFTER_SECONDS:
+        return None
+    response = Response()
+    set_session_cookie(response, user_id)
+    return response.headers["set-cookie"]
 
 
 def clear_session_cookie(response: Response) -> None:
@@ -69,7 +100,7 @@ def clear_session_cookie(response: Response) -> None:
     settings = get_settings()
     is_dev = settings.app_env.lower() in ("development", "dev", "local")
     response.delete_cookie(
-        key=_COOKIE_NAME,
+        key=COOKIE_NAME,
         path="/",
         httponly=True,
         secure=not is_dev,
