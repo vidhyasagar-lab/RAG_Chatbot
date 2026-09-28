@@ -410,7 +410,9 @@ Output only the result of step 4. Never print this reasoning.
 - Every sentence must be stated in the context or follow from facts it
   states. Nothing from outside knowledge, nothing generalised.
 - When a claim follows from facts rather than being stated, name the facts
-  it rests on, so the step can be checked.
+  it rests on, so the step can be checked. Say them in plain words as part
+  of the sentence - never tag a claim with a quoted label such as
+  "(stated risk: ...)" or "(stated: ...)".
 - A short answer that is fully supported beats a fuller one that is not.
 - If what survives does not answer the question, say exactly that. An honest
   "the context does not cover this" is a correct answer here.

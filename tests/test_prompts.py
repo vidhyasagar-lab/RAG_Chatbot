@@ -82,6 +82,13 @@ def test_an_explanation_question_is_answered_from_the_facts():
     assert "Bad:  The context does not explain" in SYSTEM_PROMPT
 
 
+def test_the_retry_prompt_forbids_quoted_evidence_tags():
+    """"Name the facts it rests on" came back as a "(stated risk: "...")" tag
+    after every bullet - evidence quoted at the reader instead of used."""
+    assert "plain words" in REFINED_SYSTEM_PROMPT
+    assert '"(stated' in REFINED_SYSTEM_PROMPT
+
+
 @PROMPTS
 def test_no_example_comes_from_the_review_document(prompt):
     lowered = prompt.lower()
