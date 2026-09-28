@@ -186,15 +186,17 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
         closed tab, a sleeping laptop - would otherwise discard an answer the
         reader has already read in full and that this function is holding.
 
-        Without a `final_attempt` to go on, the newest attempt that produced
-        text is the one the reader was looking at when the connection died.
+        Without a `final_attempt` to go on, the earliest attempt that produced
+        text is stored. A replacement only starts once its draft has finished,
+        so if the connection died mid-replacement the draft is the only whole
+        answer there is; storing the newest attempt saved half a sentence.
         """
         nonlocal saved
         if saved:
             return
         chosen = attempt if attempt is not None and answers.get(attempt) else None
         if chosen is None:
-            chosen = next((a for a in sorted(answers, reverse=True) if answers[a]), None)
+            chosen = next((a for a in sorted(answers) if answers[a]), None)
         if chosen is None:
             return
         saved = True

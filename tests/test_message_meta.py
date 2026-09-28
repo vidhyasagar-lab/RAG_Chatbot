@@ -56,6 +56,22 @@ def replaced_stream(question, chat_history=None, top_k=None, user_id="", session
     return gen()
 
 
+def cut_off_during_replacement(question, chat_history=None, top_k=None, user_id="", session_id="", gated=None):
+    """The connection dies while the replacement is still streaming."""
+    async def gen():
+        yield _meta(session_id)
+        yield _sse({"type": "token", "content": "The complete draft.", "attempt": 1})
+        yield _sse({
+            "type": "eval", "attempt": 1, "verdict": "rejected",
+            "scores": {"context_precision": 0.8, "faithfulness": 0.2, "threshold": 0.5, "passed": False},
+        })
+        yield _sse({"type": "replace", "reason": "faithfulness 0.20 < 0.50"})
+        yield _sse({"type": "token", "content": "The replacement got as far as", "attempt": 2})
+        raise RuntimeError("connection lost")
+
+    return gen()
+
+
 def plain_stream(question, chat_history=None, top_k=None, user_id="", session_id="", gated=None):
     async def gen():
         yield _meta(session_id)
@@ -113,6 +129,17 @@ def test_the_stored_verdict_is_the_one_for_the_answer_that_stands(signed_in, mon
     assert answer["content"] == "grounded"
     assert answer["eval"]["faithfulness"] == 0.95
     assert answer["eval"]["attempt"] == 2
+
+
+def test_a_cut_off_replacement_is_not_stored_over_the_complete_draft(signed_in, monkeypatch):
+    """With no `done`, the only whole answer is the draft - store that.
+
+    Storing the newest attempt instead saved half a sentence to history.
+    """
+    _, answer = _ask_and_reopen(signed_in, monkeypatch, cut_off_during_replacement)
+    assert answer["content"] == "The complete draft."
+    assert answer["eval"]["verdict"] == "rejected"
+    assert answer["eval"]["attempt"] == 1
 
 
 def test_an_ungated_answer_has_no_verdict(signed_in, monkeypatch):

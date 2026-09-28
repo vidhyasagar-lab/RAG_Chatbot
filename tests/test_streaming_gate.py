@@ -251,6 +251,17 @@ def test_gating_off_streams_without_evaluating(monkeypatch):
     assert _text(events, 1) == "draft "
 
 
+def test_gating_off_still_scores_the_answer_in_the_background(monkeypatch):
+    """The dashboard's scores come from here. Without it they stop silently."""
+    _install(monkeypatch)
+    scored = []
+    monkeypatch.setattr(engine, "evaluate_query_async", lambda **kw: scored.append(kw))
+    _collect(gated=False)
+
+    assert len(scored) == 1
+    assert scored[0]["answer"] == "draft "
+
+
 def test_context_precision_is_scored_against_the_real_answer(monkeypatch):
     """LLMContextPrecisionWithoutReference judges contexts AGAINST the response.
 
@@ -370,6 +381,62 @@ def test_concurrent_gated_requests_both_complete(monkeypatch):
     first, second = asyncio.run(run_two())
     assert first[-1]["type"] == "done"
     assert second[-1]["type"] == "done"
+
+
+# ── the reader leaves mid-pipeline ───────────────────────────────────
+
+class _Recorded:
+    """A trace or span that remembers whether it was ended."""
+
+    def __init__(self, log: list, name: str):
+        self.name, self.ended, self.id, self._log = name, False, "trace-1", log
+        log.append(self)
+
+    def span(self, **kw): return _Recorded(self._log, kw.get("name", "?"))
+    generation = span
+    def update(self, **kw): pass
+    def end(self, **kw): self.ended = True
+
+
+def _leave_when(monkeypatch, stop) -> list[_Recorded]:
+    """Read events until `stop(event)` is true, then close the stream the way
+    Starlette does when the client disconnects."""
+    opened: list[_Recorded] = []
+    monkeypatch.setattr(engine, "create_trace", lambda **kw: _Recorded(opened, "trace"))
+
+    async def run():
+        agen = engine.ask_stream(question="q", user_id="u", session_id="s", gated=True)
+        async for chunk in agen:
+            if stop(json.loads(chunk[6:])):
+                break
+        await agen.aclose()
+
+    asyncio.run(run())
+    return opened
+
+
+@pytest.mark.parametrize("where, stop", [
+    ("while the draft streams", lambda e: e["type"] == "token" and e["attempt"] == 1),
+    ("while the gate scores", lambda e: e.get("stage") == "scoring"),
+    ("while the replacement streams", lambda e: e["type"] == "token" and e["attempt"] == 2),
+])
+def test_leaving_mid_pipeline_closes_every_span_and_the_trace(monkeypatch, where, stop):
+    """An unended span shows in Langfuse as a request still running, forever."""
+    _install(monkeypatch, answers=(["bad"], ["better"]),
+             faithfulness=0.2, context_precision=0.8)
+    opened = _leave_when(monkeypatch, stop)
+
+    left_open = [o.name for o in opened if not o.ended]
+    assert left_open == [], f"left open after leaving {where}: {left_open}"
+
+
+def test_leaving_mid_draft_does_not_start_a_replacement(monkeypatch):
+    """Nobody is there to read it."""
+    client = _install(monkeypatch, answers=(["bad"], ["better"]),
+                      faithfulness=0.2, context_precision=0.8)
+    _leave_when(monkeypatch, lambda e: e["type"] == "token" and e["attempt"] == 1)
+
+    assert client.chat.completions.calls == 1
 
 
 def test_stage_events_describe_the_phase(monkeypatch):

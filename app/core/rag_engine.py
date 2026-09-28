@@ -520,195 +520,210 @@ async def ask_stream(
         },
     )
 
-    # ── Retrieval ────────────────────────────────────────────────
-    retrieval_span = trace.span(name="retrieval", input={"query": question, "top_k": top_k})
-    context_text, sources, images = _build_context(question, top_k, user_id=user_id)
-    retrieval_span.update(output={"sources_count": len(sources), "images_count": len(images)})
-    retrieval_span.end()
+    # Everything opened below is closed on the way out, however the way out
+    # happens. A reader who leaves arrives as GeneratorExit at a yield or as
+    # CancelledError at an await; neither passes the normal ends, and an
+    # unended span shows in Langfuse as a request that never finished.
+    still_open: list = [trace]
 
-    yield _sse({
-        "type": "meta",
-        "sources": sources,
-        "images": images,
-        "trace_id": trace.id,
-        "session_id": session_id,
-    })
+    def _opened(obs):
+        still_open.append(obs)
+        return obs
 
-    context_chunks = [
-        part.split("\n", 1)[-1]
-        for part in context_text.split("\n\n---\n\n")
-        if part.strip()
-    ]
-    client = _get_async_client()
+    def _close(obs):
+        obs.end()
+        still_open.remove(obs)
 
-    # ── Attempt 1 ────────────────────────────────────────────────
-    yield _sse({"type": "stage", "stage": "generating", "attempt": 1})
-
-    messages = _build_messages(SYSTEM_PROMPT, context_text, chat_history, question)
-    gen_span = trace.generation(
-        name="llm-completion",
-        model=settings.azure_openai_model,
-        input=messages,
-        model_parameters={"max_tokens": settings.max_tokens,
-                          "temperature": settings.temperature},
-    )
-    draft: dict = {"text": "", "usage": {}}
     try:
+        # ── Retrieval ────────────────────────────────────────────────
+        retrieval_span = _opened(trace.span(name="retrieval", input={"query": question, "top_k": top_k}))
+        context_text, sources, images = _build_context(question, top_k, user_id=user_id)
+        retrieval_span.update(output={"sources_count": len(sources), "images_count": len(images)})
+        _close(retrieval_span)
+
+        yield _sse({
+            "type": "meta",
+            "sources": sources,
+            "images": images,
+            "trace_id": trace.id,
+            "session_id": session_id,
+        })
+
+        context_chunks = [
+            part.split("\n", 1)[-1]
+            for part in context_text.split("\n\n---\n\n")
+            if part.strip()
+        ]
+        client = _get_async_client()
+
+        # ── Attempt 1 ────────────────────────────────────────────────
+        yield _sse({"type": "stage", "stage": "generating", "attempt": 1})
+
+        messages = _build_messages(SYSTEM_PROMPT, context_text, chat_history, question)
+        gen_span = _opened(trace.generation(
+            name="llm-completion",
+            model=settings.azure_openai_model,
+            input=messages,
+            model_parameters={"max_tokens": settings.max_tokens,
+                              "temperature": settings.temperature},
+        ))
+        draft: dict = {"text": "", "usage": {}}
         async for event in _stream_answer(client, messages, settings, 1, draft):
             yield event
-    except asyncio.CancelledError:
-        # The reader went away mid-stream (Caddy logs this as
-        # "aborting with incomplete response"). Nothing left to do for them.
-        gen_span.end()
-        raise
 
-    answer = draft["text"]
-    usage = dict(draft["usage"])
-    gen_span.update(output=answer, usage=usage)
-    gen_span.end()
+        answer = draft["text"]
+        usage = dict(draft["usage"])
+        gen_span.update(output=answer, usage=usage)
+        _close(gen_span)
 
-    final_answer, final_attempt = answer, 1
+        final_answer, final_attempt = answer, 1
 
-    if not gated:
-        trace.update(output={"answer": answer, "sources_count": len(sources)})
-        trace_id = trace.id
-        trace.end()
-        evaluate_query_async(question=question, answer=answer, contexts=context_chunks,
-                             trace_id=trace_id, user_id=user_id)
-        logger.info("rag_stream_completed", question_len=len(question),
-                    context_chunks=len(sources), trace_id=trace_id)
-        yield _sse({"type": "done", "usage": usage, "final_attempt": 1})
-        return
-
-    # ── The gate ─────────────────────────────────────────────────
-    yield _sse({"type": "stage", "stage": "scoring", "attempt": 1})
-
-    # Cost tracks claim count, which tracks answer length, so cap the input -
-    # but cut on a boundary. A mid-word cut leaves a dangling fragment that
-    # ragas decomposes into an unverifiable claim, which can reject a complete,
-    # correct answer purely because of where the cut landed.
-    scored_text = _truncate_on_boundary(answer, settings.eval_max_answer_chars)
-    eval_span = trace.span(
-        name="quality-gate",
-        input={"answer_len": len(scored_text),
-               "truncated": len(scored_text) < len(answer),
-               "full_answer_len": len(answer)},
-    )
-
-    # Both metrics need the answer, so neither can overlap generation. They do
-    # overlap each other: the gate costs max(faithfulness, precision) rather
-    # than their sum, and the whole thing is off the reader's path anyway.
-    #
-    # return_exceptions keeps one metric's failure from discarding the other's
-    # result - notably on timeout, where a score that finished at 118s should
-    # not be thrown away with the one that did not.
-    faithfulness = context_precision = None
-    try:
-        async with _EVAL_SLOTS:
-            results = await asyncio.wait_for(
-                asyncio.gather(
-                    _run_metric(evaluate_faithfulness_sync, question, scored_text, context_chunks),
-                    _run_metric(evaluate_context_precision_sync, question, context_chunks, scored_text),
-                    return_exceptions=True,
-                ),
-                timeout=settings.eval_timeout_seconds,
-            )
-        faithfulness, context_precision = (
-            None if isinstance(r, BaseException) else r for r in results
-        )
-    except Exception as exc:
-        # Covers the timeout too (asyncio.TimeoutError is an Exception), but
-        # deliberately NOT asyncio.CancelledError, which is a BaseException
-        # and means the reader disconnected - that should propagate.
-        #
-        # A gate that fails must never cost the reader the answer they can
-        # already see. Report it as unscored and keep the draft.
-        #
-        # Note: asyncio.to_thread cannot be cancelled, so on timeout the
-        # ragas call keeps running to completion in its worker thread. It is
-        # abandoned, not killed; it holds one thread until it finishes.
-        logger.warning("faithfulness_gate_unavailable",
-                       error=f"{type(exc).__name__}: {exc}", trace_id=trace.id)
-        faithfulness = None
-
-    threshold = settings.eval_quality_threshold
-    verdict = _decide_verdict(faithfulness, context_precision, threshold)
-    scores = {
-        "faithfulness": faithfulness,
-        "context_precision": context_precision,
-        "threshold": threshold,
-        "passed": verdict == VERDICT_PASSED,
-    }
-    eval_span.update(output={**scores, "verdict": verdict})
-    eval_span.end()
-
-    yield _sse({"type": "eval", "attempt": 1, "verdict": verdict, "scores": scores})
-
-    # ── Attempt 2, only when regenerating could change the outcome ──
-    if verdict == VERDICT_REJECTED and settings.eval_max_retries > 0:
-        logger.warning("faithfulness_gate_failed_regenerating",
-                       faithfulness=faithfulness, threshold=threshold, trace_id=trace.id)
-        yield _sse({
-            "type": "replace",
-            "reason": f"faithfulness {faithfulness:.2f} < {threshold:.2f}",
-        })
-        yield _sse({"type": "stage", "stage": "regenerating", "attempt": 2})
-
-        refined = _build_messages(REFINED_SYSTEM_PROMPT, context_text, chat_history, question)
-        regen_span = trace.generation(
-            name="llm-completion-regenerated",
-            model=settings.azure_openai_model,
-            input=refined,
-            model_parameters={"max_tokens": settings.max_tokens,
-                              "temperature": max(settings.temperature - 0.1, 0.0)},
-        )
-        replacement: dict = {"text": "", "usage": {}}
-        async for event in _stream_answer(client, refined, settings, 2, replacement):
-            yield event
-        regen_answer = replacement["text"]
-        regen_usage = replacement["usage"]
-        regen_span.update(output=regen_answer, usage=regen_usage)
-        regen_span.end()
-
-        # Deliberately NOT scored here. The old pipeline ran the metric a
-        # second time before returning, which cost ~74s of a 3m41s request
-        # and appeared in no Langfuse span. It is scored in the background
-        # below, like every other answer.
-        if not regen_answer.strip():
-            # A content filter or an empty completion. Switching to it would
-            # leave the reader with a rejection notice and nothing else, and
-            # throw away a draft that was at least readable.
-            logger.warning("regeneration_empty_keeping_draft", trace_id=trace.id)
-            yield _sse({
-                "type": "eval", "attempt": 2, "verdict": VERDICT_UNSCORED,
-                "scores": {"faithfulness": None, "context_precision": None,
-                           "threshold": threshold, "passed": False},
-            })
+        if not gated:
+            trace.update(output={"answer": answer, "sources_count": len(sources)})
+            trace_id = trace.id
+            _close(trace)
+            evaluate_query_async(question=question, answer=answer, contexts=context_chunks,
+                                 trace_id=trace_id, user_id=user_id)
+            logger.info("rag_stream_completed", question_len=len(question),
+                        context_chunks=len(sources), trace_id=trace_id)
             yield _sse({"type": "done", "usage": usage, "final_attempt": 1})
-            trace.update(output={"answer": answer, "sources_count": len(sources),
-                                 "verdict": verdict, "final_attempt": 1})
-            trace.end()
             return
 
-        final_answer, final_attempt = regen_answer, 2
-        usage = {k: usage.get(k, 0) + regen_usage.get(k, 0)
-                 for k in ("prompt_tokens", "completion_tokens", "total_tokens")}
-    elif verdict == VERDICT_RETRIEVAL_FAILED:
-        logger.info("regeneration_skipped_retrieval_failed",
-                    faithfulness=faithfulness, trace_id=trace.id)
+        # ── The gate ─────────────────────────────────────────────────
+        yield _sse({"type": "stage", "stage": "scoring", "attempt": 1})
 
-    trace.update(output={"answer": final_answer, "sources_count": len(sources),
-                         "verdict": verdict, "final_attempt": final_attempt})
-    trace_id = trace.id
-    trace.end()
+        # Cost tracks claim count, which tracks answer length, so cap the input -
+        # but cut on a boundary. A mid-word cut leaves a dangling fragment that
+        # ragas decomposes into an unverifiable claim, which can reject a complete,
+        # correct answer purely because of where the cut landed.
+        scored_text = _truncate_on_boundary(answer, settings.eval_max_answer_chars)
+        eval_span = _opened(trace.span(
+            name="quality-gate",
+            input={"answer_len": len(scored_text),
+                   "truncated": len(scored_text) < len(answer),
+                   "full_answer_len": len(answer)},
+        ))
 
-    logger.info("rag_stream_gated_completed", question_len=len(question),
-                context_chunks=len(sources), verdict=verdict,
-                final_attempt=final_attempt, faithfulness=faithfulness,
-                context_precision=context_precision, trace_id=trace_id)
+        # Both metrics need the answer, so neither can overlap generation. They do
+        # overlap each other: the gate costs max(faithfulness, precision) rather
+        # than their sum, and the whole thing is off the reader's path anyway.
+        #
+        # return_exceptions keeps one metric's failure from discarding the other's
+        # result - notably on timeout, where a score that finished at 118s should
+        # not be thrown away with the one that did not.
+        faithfulness = context_precision = None
+        try:
+            async with _EVAL_SLOTS:
+                results = await asyncio.wait_for(
+                    asyncio.gather(
+                        _run_metric(evaluate_faithfulness_sync, question, scored_text, context_chunks),
+                        _run_metric(evaluate_context_precision_sync, question, context_chunks, scored_text),
+                        return_exceptions=True,
+                    ),
+                    timeout=settings.eval_timeout_seconds,
+                )
+            faithfulness, context_precision = (
+                None if isinstance(r, BaseException) else r for r in results
+            )
+        except Exception as exc:
+            # Covers the timeout too (asyncio.TimeoutError is an Exception), but
+            # deliberately NOT asyncio.CancelledError, which is a BaseException
+            # and means the reader disconnected - that should propagate.
+            #
+            # A gate that fails must never cost the reader the answer they can
+            # already see. Report it as unscored and keep the draft.
+            #
+            # Note: asyncio.to_thread cannot be cancelled, so on timeout the
+            # ragas call keeps running to completion in its worker thread. It is
+            # abandoned, not killed; it holds one thread until it finishes.
+            logger.warning("faithfulness_gate_unavailable",
+                           error=f"{type(exc).__name__}: {exc}", trace_id=trace.id)
+            faithfulness = None
 
-    evaluate_query_async(question=question, answer=final_answer, contexts=context_chunks,
-                         trace_id=trace_id, user_id=user_id)
+        threshold = settings.eval_quality_threshold
+        verdict = _decide_verdict(faithfulness, context_precision, threshold)
+        scores = {
+            "faithfulness": faithfulness,
+            "context_precision": context_precision,
+            "threshold": threshold,
+            "passed": verdict == VERDICT_PASSED,
+        }
+        eval_span.update(output={**scores, "verdict": verdict})
+        _close(eval_span)
 
-    yield _sse({"type": "done", "usage": usage, "final_attempt": final_attempt})
+        yield _sse({"type": "eval", "attempt": 1, "verdict": verdict, "scores": scores})
+
+        # ── Attempt 2, only when regenerating could change the outcome ──
+        if verdict == VERDICT_REJECTED and settings.eval_max_retries > 0:
+            logger.warning("faithfulness_gate_failed_regenerating",
+                           faithfulness=faithfulness, threshold=threshold, trace_id=trace.id)
+            yield _sse({
+                "type": "replace",
+                "reason": f"faithfulness {faithfulness:.2f} < {threshold:.2f}",
+            })
+            yield _sse({"type": "stage", "stage": "regenerating", "attempt": 2})
+
+            refined = _build_messages(REFINED_SYSTEM_PROMPT, context_text, chat_history, question)
+            regen_span = _opened(trace.generation(
+                name="llm-completion-regenerated",
+                model=settings.azure_openai_model,
+                input=refined,
+                model_parameters={"max_tokens": settings.max_tokens,
+                                  "temperature": max(settings.temperature - 0.1, 0.0)},
+            ))
+            replacement: dict = {"text": "", "usage": {}}
+            async for event in _stream_answer(client, refined, settings, 2, replacement):
+                yield event
+            regen_answer = replacement["text"]
+            regen_usage = replacement["usage"]
+            regen_span.update(output=regen_answer, usage=regen_usage)
+            _close(regen_span)
+
+            # Deliberately NOT scored here. The old pipeline ran the metric a
+            # second time before returning, which cost ~74s of a 3m41s request
+            # and appeared in no Langfuse span. It is scored in the background
+            # below, like every other answer.
+            if not regen_answer.strip():
+                # A content filter or an empty completion. Switching to it would
+                # leave the reader with a rejection notice and nothing else, and
+                # throw away a draft that was at least readable.
+                logger.warning("regeneration_empty_keeping_draft", trace_id=trace.id)
+                yield _sse({
+                    "type": "eval", "attempt": 2, "verdict": VERDICT_UNSCORED,
+                    "scores": {"faithfulness": None, "context_precision": None,
+                               "threshold": threshold, "passed": False},
+                })
+                yield _sse({"type": "done", "usage": usage, "final_attempt": 1})
+                trace.update(output={"answer": answer, "sources_count": len(sources),
+                                     "verdict": verdict, "final_attempt": 1})
+                _close(trace)
+                return
+
+            final_answer, final_attempt = regen_answer, 2
+            usage = {k: usage.get(k, 0) + regen_usage.get(k, 0)
+                     for k in ("prompt_tokens", "completion_tokens", "total_tokens")}
+        elif verdict == VERDICT_RETRIEVAL_FAILED:
+            logger.info("regeneration_skipped_retrieval_failed",
+                        faithfulness=faithfulness, trace_id=trace.id)
+
+        trace.update(output={"answer": final_answer, "sources_count": len(sources),
+                             "verdict": verdict, "final_attempt": final_attempt})
+        trace_id = trace.id
+        _close(trace)
+
+        logger.info("rag_stream_gated_completed", question_len=len(question),
+                    context_chunks=len(sources), verdict=verdict,
+                    final_attempt=final_attempt, faithfulness=faithfulness,
+                    context_precision=context_precision, trace_id=trace_id)
+
+        evaluate_query_async(question=question, answer=final_answer, contexts=context_chunks,
+                             trace_id=trace_id, user_id=user_id)
+
+        yield _sse({"type": "done", "usage": usage, "final_attempt": final_attempt})
+    except BaseException:
+        if trace in still_open:
+            trace.update(output={"abandoned": True})
+        for obs in reversed(still_open):
+            obs.end()
+        raise
 
