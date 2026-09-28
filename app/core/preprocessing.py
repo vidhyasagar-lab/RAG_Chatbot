@@ -601,10 +601,19 @@ def _emit_docx_image(result: PreprocessedDocument, pending: list[_PendingVisual]
 
 
 def _docx_table_to_markdown(table) -> str:
-    """Convert a python-docx Table object to a Markdown table string."""
+    """Convert a python-docx Table object to a Markdown table string.
+
+    python-docx repeats a horizontally merged cell once per grid column it
+    spans. Only the first is written; the rest are blank, which keeps the
+    column count. Vertical merges keep repeating, so each row reads alone.
+    """
     rows = []
     for row in table.rows:
-        cells = [cell.text.strip().replace("|", "\\|") for cell in row.cells]
+        cells, previous = [], None
+        for cell in row.cells:
+            spanned = previous is not None and cell._tc is previous._tc
+            cells.append("" if spanned else cell.text.strip().replace("|", "\\|"))
+            previous = cell
         rows.append("| " + " | ".join(cells) + " |")
 
     if len(rows) < 1:
