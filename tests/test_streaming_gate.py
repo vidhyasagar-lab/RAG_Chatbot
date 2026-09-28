@@ -366,6 +366,26 @@ def test_a_rewrite_whose_check_times_out_shows_no_score(monkeypatch):
     assert _gate(saved)["draft_faithfulness"] == 0.2
 
 
+def test_the_rewrite_check_has_its_own_shorter_deadline(monkeypatch):
+    """The UI polls for a bounded time. Draft check, rewrite and a second full
+    eval timeout could outlast it, leaving the reader the rejected draft."""
+    from app.config import get_settings
+
+    _install(monkeypatch, answers=(["bad"], ["better"]), context_precision=0.8)
+    saved = _saved(monkeypatch)
+    _faith_by_answer(monkeypatch, {"bad": 0.2, "better": (1.5, 0.9)})
+    monkeypatch.setattr(get_settings(), "eval_timeout_seconds", 5.0)
+    monkeypatch.setattr(engine, "REWRITE_SCORE_TIMEOUT_SECONDS", 0.3)
+    _collect()
+
+    assert _gate(saved)["faithfulness"] is None
+    assert engine.REWRITE_SCORE_TIMEOUT_SECONDS == 0.3
+
+
+def test_the_rewrite_deadline_is_well_inside_the_ui_poll_window():
+    assert engine.REWRITE_SCORE_TIMEOUT_SECONDS <= 45
+
+
 def test_a_low_scoring_rewrite_is_not_rewritten_again(monkeypatch):
     """One rewrite, then the verdict stands - however the rewrite scores."""
     client = _install(monkeypatch, answers=(["bad"], ["better"]), context_precision=0.8)
