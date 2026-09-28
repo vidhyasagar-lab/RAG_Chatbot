@@ -356,6 +356,23 @@ def _make_parent_id(text: str) -> str:
     return hashlib.sha256(text[:512].encode()).hexdigest()[:12]
 
 
+def _has_body(doc: Document) -> bool:
+    """False for a text chunk that is nothing but Markdown headings.
+
+    A heading followed directly by one at the same or a higher level becomes
+    a chunk of its own - `## Composite ranking` does, once its table has been
+    extracted separately. Being short, it wins on BM25 length normalisation
+    and outranks the content it names. Its words are not lost: after the
+    body-order walk they are in the breadcrumb of everything beneath it.
+
+    Short is not empty. Only a chunk with no body at all is dropped.
+    """
+    if doc.metadata.get("content_type", "text") != "text":
+        return True
+    lines = [line for line in doc.page_content.splitlines() if line.strip()]
+    return any(not line.lstrip().startswith("#") for line in lines)
+
+
 # ── Step 7: Near-duplicate removal ───────────────────────────────────
 
 def _dedup_chunks(docs: list[Document], threshold: float = 0.9) -> list[Document]:
@@ -414,11 +431,15 @@ def chunk_documents(docs: list[Document]) -> tuple[list[Document], list[Document
         max_tokens=settings.parent_chunk_tokens,
         overlap_tokens=settings.parent_overlap_tokens,
     )
+    parents = [p for p in parents if _has_body(p)]
     for p in parents:
         p.metadata["chunk_type"] = "parent"
         p.metadata["chunk_id"] = _make_parent_id(p.page_content)
 
-    # 5. Contextual headers (on a copy so parent raw text stays clean)
+    # 5. Contextual headers. The header-injected copies are what gets returned:
+    # retrieval replaces each matched child with its parent, so the parent is
+    # the text the model reads, and without the header it never learns which
+    # document or section a table came from.
     parents_with_headers = _inject_context_headers(
         [Document(page_content=p.page_content, metadata=dict(p.metadata)) for p in parents]
     )
@@ -448,4 +469,4 @@ def chunk_documents(docs: list[Document]) -> tuple[list[Document], list[Document
         parent_chunks=len(parents),
         child_chunks=len(children),
     )
-    return parents, children
+    return parents_with_headers, children
