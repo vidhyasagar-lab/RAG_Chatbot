@@ -50,6 +50,22 @@ def test_outside_knowledge_is_still_forbidden(prompt):
     assert "outside knowledge" in prompt.lower()
 
 
+def test_the_answer_prompt_does_not_invite_case_labels():
+    """Bullets written as "Stated: ..." taught the model to open an answer with
+    "Unsupported:" - it printed the label it had been given."""
+    import re
+
+    assert not re.search(r"^\s*-\s*(Stated|Entailed|Unsupported)\s*:", SYSTEM_PROMPT, re.M)
+    assert "Never label" in SYSTEM_PROMPT
+
+
+def test_a_judgment_question_is_answered_from_the_facts_to_compare():
+    """"Which best balances X, Y and Z?" was refused because no single number
+    combines them, though every fact needed to compare was retrieved."""
+    assert "judgment" in SYSTEM_PROMPT
+    assert "what the choice is based on" in SYSTEM_PROMPT
+
+
 @PROMPTS
 def test_no_example_comes_from_the_review_document(prompt):
     lowered = prompt.lower()
