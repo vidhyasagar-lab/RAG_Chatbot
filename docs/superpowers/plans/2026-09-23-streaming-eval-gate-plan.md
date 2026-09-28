@@ -3,6 +3,29 @@
 Spec: `docs/superpowers/specs/2026-09-23-streaming-eval-gate-design.md`
 Branch: `headless-api`
 
+## As built (reconciled 2026-09-28)
+
+This plan was written before implementation found that `context_precision`
+needs the answer (see the spec's "Correction"). Where the steps below disagree
+with the code, the code and the spec are right:
+
+- **Task 2 step 4:** `evaluate_context_precision_sync` keeps its cache read,
+  keyed on the answer like faithfulness. It does not drop it.
+- **Task 3 step 1:** there is no `_async_generate_answer`; tests stub
+  `_get_async_client` and `_build_context`.
+- **Task 3 step 3:** `context_precision` runs concurrently with faithfulness
+  *after* streaming, not with generation.
+
+Work done outside these tasks:
+
+- `282a7b9`: score context precision against the real answer instead of the
+  literal string `"placeholder"`, which had pinned it at 0.0.
+- `e87116f`: fixes from the whole-change review.
+- 2026-09-28 gap review: a dropped connection mid-replacement stored the
+  half-written replacement (now the complete draft); a disconnect at any
+  stage left Langfuse spans and the trace open; the review-focus disconnect
+  and gating-off background eval cases had no tests. All fixed with tests.
+
 ## Global constraints
 
 - Tests run with `uv run python -m pytest` (never bare `pytest` — console-script

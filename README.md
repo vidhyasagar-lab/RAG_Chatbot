@@ -405,51 +405,46 @@ Question → Hybrid Search → Context Assembly → LLM Generation → Response
 
 ## Eval-Gated Pipeline
 
-The eval-gated pipeline (`ask_with_eval()` in `rag_engine.py`) ensures answer quality before delivery by running RAGAS metrics in-line:
+`ask_stream()` in `rag_engine.py` streams the answer as it is generated and runs the RAGAS quality gate **after** it has streamed. The gate takes 25–120s and cannot be made faster (measured: gpt-5.2 averages 24s on faithfulness; a smaller model was slower), so the reader never waits for it.
 
 ```
 Question
     │
     ▼
-┌─── Retrieve Context ───┐
-│                        │
-▼                        ▼
-Generate Answer     Context Precision
-(async, parallel)   (sync in thread, parallel)
-│                        │
-└────────┬───────────────┘
-         ▼
-   Faithfulness Gate
-   (needs the answer)
-         │
-    ┌────┴────┐
-    │ PASS    │ FAIL
-    ▼         ▼
-  Stream    Regenerate with
-  Answer    stricter prompt
-              │
-              ▼
-         Re-check Faithfulness
-              │
-         ┌────┴────┐
-         │ PASS    │ FAIL (use if better)
-         ▼         ▼
-       Stream    Stream best answer
-       Answer    with warning
+Retrieve context ──► meta (sources, figures)
+    │
+    ▼
+Stream answer, attempt 1 ──► tokens reach the reader immediately
+    │
+    ▼
+Gate: faithfulness + context precision, concurrently, bounded by EVAL_TIMEOUT_SECONDS
+    │
+    ├── faithfulness ≥ threshold ........ passed            → done
+    ├── metric errored or timed out ..... unscored          → done, draft kept
+    ├── context precision = 0.0 ......... retrieval_failed  → done (regenerating cannot help)
+    └── otherwise ....................... rejected          → replace → stream attempt 2 → done
 ```
 
-**Latency-optimised flow:**
-1. **Parallel step**: Generate answer (async) + evaluate context precision (in threadpool) — concurrently
-2. **Sequential step**: Run faithfulness check on the generated answer
-3. **Gate check**: If `faithfulness >= threshold` → stream the answer
-4. **Regeneration**: On failure, regenerate with a stricter system prompt (lower temperature, explicit faithfulness instructions) and re-check
-5. **Fallback**: Use the better-scoring answer (original or regenerated)
+- **Regeneration** uses a stricter prompt at a lower temperature. It happens at most once.
+- **The replacement is not re-gated.** It is scored in the background like every other answer.
+- **Gate failures never cost the reader the answer.** A metric that raises or times out yields `unscored` and keeps the draft.
+- **Only the answer that stands is stored.** If the connection drops before `done`, the complete draft is stored, never a half-streamed replacement.
+- **`EVAL_GATING_ENABLED=false`** streams the same way, skips the gate, and still scores in the background.
 
-**SSE Event Stream:**
-- `{"type": "meta", ...}` — sources, images, trace_id
-- `{"type": "eval", "scores": {...}}` — quality gate result (pass/fail + scores)
-- `{"type": "token", "content": "..."}` — each token of the verified answer
-- `{"type": "done", "usage": {...}}` — final token usage stats
+**SSE event stream:**
+
+```
+meta → stage → token+ → [eval → [replace → stage → token+]] → done
+```
+
+- `{"type": "meta", ...}`: sources, images, trace_id, session_id
+- `{"type": "stage", "stage": "generating" | "scoring" | "regenerating", "attempt": n}`
+- `{"type": "token", "content": "...", "attempt": n}`: `attempt` tells the client which answer a token belongs to
+- `{"type": "eval", "attempt": n, "verdict": "...", "scores": {...}}`
+- `{"type": "replace", "reason": "..."}`: everything streamed so far is superseded
+- `{"type": "done", "usage": {...}, "final_attempt": n}`
+
+Design and measurements: `docs/superpowers/specs/2026-09-23-streaming-eval-gate-design.md`.
 
 ---
 
@@ -742,7 +737,7 @@ docker compose up --build -d
 │   │       └── pages.py         # Server-rendered pages (login, app, admin, HTMX partials)
 │   │
 │   ├── core/
-│   │   ├── rag_engine.py        # RAG orchestrator: ask(), ask_stream(), ask_with_eval()
+│   │   ├── rag_engine.py        # RAG orchestrator: ask(), ask_stream() with the eval gate
 │   │   ├── vector_store.py      # FAISS + BM25 hybrid store, RRF fusion, parent expansion
 │   │   ├── document_loader.py   # File I/O, multimodal loading, 7-step chunking pipeline
 │   │   ├── preprocessing.py     # PDF/DOCX visual extraction, content classification, vision prompts
