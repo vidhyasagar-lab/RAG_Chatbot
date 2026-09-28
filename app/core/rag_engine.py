@@ -451,8 +451,11 @@ async def _stream_answer(client, messages, settings, attempt: int, into: dict):
             # The usage-bearing chunk arrives last and carries no choices.
             if getattr(chunk, "usage", None):
                 usage = _usage_of(chunk)
-            if chunk.choices and chunk.choices[0].delta.content:
-                token = chunk.choices[0].delta.content
+            # Azure also streams chunks whose choice has no delta (content-filter
+            # results, the finish marker), so the delta itself may be None.
+            delta = chunk.choices[0].delta if chunk.choices else None
+            token = getattr(delta, "content", None)
+            if token:
                 parts.append(token)
                 yield _sse({"type": "token", "content": token, "attempt": attempt})
     finally:
