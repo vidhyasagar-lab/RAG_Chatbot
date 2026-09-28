@@ -270,7 +270,12 @@ def _structural_split(docs: list[Document]) -> list[Document]:
                 split.metadata[k] for k in ("h1", "h2", "h3", "h4") if k in split.metadata
             ]
             if header_parts:
-                merged_meta["section_header"] = " > ".join(header_parts)
+                # A figure already knows the section it sits under; headings
+                # inside its vision description ("## Chart type") extend that
+                # breadcrumb rather than replacing it.
+                inherited = doc.metadata.get("section_header", "")
+                merged_meta["section_header"] = " > ".join(
+                    ([inherited] if inherited else []) + header_parts)
             result.append(Document(page_content=split.page_content, metadata=merged_meta))
 
     logger.info("structural_split", input=len(docs), output=len(result))

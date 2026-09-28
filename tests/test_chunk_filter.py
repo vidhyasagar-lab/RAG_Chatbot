@@ -41,6 +41,21 @@ def test_parents_carry_the_document_and_section_line():
     assert parents[0].page_content.startswith("[Document: r.docx | Section: A > B]")
 
 
+def test_headings_inside_a_figure_description_extend_its_breadcrumb():
+    """Vision descriptions contain their own headings ("## Chart type"). They
+    used to replace the section the figure sits under instead of extending it."""
+    from app.core.document_loader import _structural_split
+
+    figure = _doc("[Chart 1]\n## Chart type\nA bar chart.\n## Key trends\nRising.",
+                  content_type="chart")
+    figure.metadata["section_header"] = "9 Markets > Ranking"
+
+    sections = [d.metadata["section_header"] for d in _structural_split([figure])]
+
+    assert sections and all(s.startswith("9 Markets > Ranking") for s in sections)
+    assert "9 Markets > Ranking > Chart type" in sections
+
+
 def test_a_short_table_is_kept():
     parents, _ = chunk_documents([_doc("[Table 1]\n| a |", content_type="table")])
 
