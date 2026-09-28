@@ -216,6 +216,7 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
                 "passed": early["verdict"] == "passed",
                 "verdict": early["verdict"],
                 "attempt": 2 if early["revised_answer"] else 1,
+                "draft_faithfulness": early["draft_faithfulness"],
             }
         add_message(session_id, "assistant", content, meta=meta or None)
         # Charged here rather than at the start, so the budget tracks answers

@@ -15,8 +15,10 @@ import pytest
 from app.core.chat_store import add_message, create_session, get_session_messages, revise_answer_message
 from app.core.eval_store import get_gate_result, save_gate_result
 
-RESULT = {"verdict": "rejected", "faithfulness": 0.2, "context_precision": 0.8,
-          "threshold": 0.5, "revised_answer": "the grounded answer"}
+# faithfulness is the rewrite's; draft_faithfulness the rejected draft's.
+RESULT = {"verdict": "rejected", "faithfulness": 0.86, "context_precision": 0.8,
+          "threshold": 0.5, "revised_answer": "the grounded answer",
+          "draft_faithfulness": 0.2}
 
 
 def _trace() -> str:
@@ -30,6 +32,22 @@ def test_a_saved_result_reads_back_for_its_owner():
     save_gate_result(trace, "alice", RESULT)
 
     assert get_gate_result(trace, "alice") == RESULT
+
+
+def test_a_table_from_before_draft_scores_gains_the_column():
+    """The VM's gate_results predates draft_faithfulness."""
+    import sqlite3
+
+    from app.core import eval_store
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE gate_results (trace_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, "
+                 "verdict TEXT NOT NULL, faithfulness REAL, context_precision REAL, "
+                 "threshold REAL NOT NULL, revised_answer TEXT, created_at TEXT NOT NULL)")
+    eval_store._init_tables(conn)
+
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(gate_results)").fetchall()]
+    assert "draft_faithfulness" in cols
 
 
 def test_someone_elses_result_reads_as_absent():
@@ -139,6 +157,9 @@ def test_a_gate_that_finishes_before_the_answer_is_stored_is_not_lost(signed_in,
     answer = client.get(f"/api/v1/chat/sessions/{session_id}").json()["messages"][-1]
     assert answer["content"] == "the grounded answer"
     assert answer["eval"]["verdict"] == "rejected"
+    # The rewrite's score, not the rejected draft's.
+    assert answer["eval"]["faithfulness"] == 0.86
+    assert answer["eval"]["draft_faithfulness"] == 0.2
 
 
 def test_the_endpoint_hides_other_users_results(signed_in):

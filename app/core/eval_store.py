@@ -84,6 +84,7 @@ def _init_tables(conn: sqlite3.Connection) -> None:
             context_precision REAL,
             threshold       REAL NOT NULL,
             revised_answer  TEXT,
+            draft_faithfulness REAL,
             created_at      TEXT NOT NULL
         );
 
@@ -101,6 +102,12 @@ def _init_tables(conn: sqlite3.Connection) -> None:
     cols = [r[1] for r in conn.execute("PRAGMA table_info(query_scores)").fetchall()]
     if "user_id" not in cols:
         conn.execute("ALTER TABLE query_scores ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    # Migrate: gate_results gained the rejected draft's score. Older rows
+    # read it as None.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(gate_results)").fetchall()]
+    if "draft_faithfulness" not in cols:
+        conn.execute("ALTER TABLE gate_results ADD COLUMN draft_faithfulness REAL")
         conn.commit()
 
 
@@ -325,8 +332,11 @@ def get_query_scores(trace_id: str, user_id: str | None = None) -> dict | None:
 #
 # The gate runs after the answer has streamed, so its verdict - and the
 # revised answer, when it rejected the draft - is stored here and polled.
+# After a rewrite, `faithfulness` is the rewrite's and `draft_faithfulness`
+# the rejected draft's, so the badge never shows one on the other.
 
-_GATE_FIELDS = ("verdict", "faithfulness", "context_precision", "threshold", "revised_answer")
+_GATE_FIELDS = ("verdict", "faithfulness", "context_precision", "threshold", "revised_answer",
+                "draft_faithfulness")
 
 
 def save_gate_result(trace_id: str, user_id: str, result: dict) -> None:
@@ -336,7 +346,7 @@ def save_gate_result(trace_id: str, user_id: str, result: dict) -> None:
         conn.execute(
             "INSERT OR REPLACE INTO gate_results "
             "(trace_id, user_id, verdict, faithfulness, context_precision, threshold, "
-            "revised_answer, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "revised_answer, draft_faithfulness, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (trace_id, user_id, *(result.get(k) for k in _GATE_FIELDS), now),
         )
         conn.commit()

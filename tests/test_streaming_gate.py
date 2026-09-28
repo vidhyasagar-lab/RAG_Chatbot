@@ -129,15 +129,37 @@ def _install(
 
 def _saved(monkeypatch) -> dict:
     """Capture what the background gate persists, instead of writing SQLite."""
-    saved = {"results": [], "revisions": []}
+    saved = {"results": [], "revisions": [], "metas": []}
     monkeypatch.setattr(engine, "save_gate_result",
                         lambda trace_id, user_id, result: saved["results"].append(result))
-    monkeypatch.setattr(
-        engine, "revise_answer_message",
-        lambda trace_id, revised, eval_meta: saved["revisions"].append(
-            (trace_id, revised, eval_meta["verdict"])),
-    )
+
+    def _revise(trace_id, revised, eval_meta):
+        saved["revisions"].append((trace_id, revised, eval_meta["verdict"]))
+        saved["metas"].append(eval_meta)
+
+    monkeypatch.setattr(engine, "revise_answer_message", _revise)
     return saved
+
+
+def _faith_by_answer(monkeypatch, scores: dict) -> list[str]:
+    """Faithfulness per answer text, so a draft and its rewrite score apart.
+    A value that is an exception is raised; a (seconds, score) tuple sleeps."""
+    import time
+
+    calls: list[str] = []
+
+    def _faith(question, answer, contexts):
+        calls.append(answer)
+        score = scores[answer]
+        if isinstance(score, Exception):
+            raise score
+        if isinstance(score, tuple):
+            time.sleep(score[0])
+            return score[1]
+        return score
+
+    monkeypatch.setattr(engine, "evaluate_faithfulness_sync", _faith)
+    return calls
 
 
 def _collect(gated=True, **kw):
@@ -302,20 +324,68 @@ def test_a_slow_precision_metric_does_not_discard_a_finished_faithfulness(monkey
     assert _gate(saved)["context_precision"] is None
 
 
-def test_the_regenerated_answer_is_not_gated_again(monkeypatch):
-    calls = []
-    _install(monkeypatch, answers=(["bad"], ["better"]),
-             faithfulness=0.2, context_precision=0.8)
-    original = engine.evaluate_faithfulness_sync
+# ── the rewrite carries its own score, never the draft's ─────────────
+# The badge on a rewrite showed the rejected draft's 0.43: a reasonable answer
+# labelled low confidence by a score that was never about it.
 
-    def counting(question, answer, contexts):
-        calls.append(answer)
-        return original(question, answer, contexts)
-
-    monkeypatch.setattr(engine, "evaluate_faithfulness_sync", counting)
+def test_a_rewrite_is_scored_and_the_draft_score_is_kept_apart(monkeypatch):
+    _install(monkeypatch, answers=(["bad"], ["better"]), context_precision=0.8)
+    saved = _saved(monkeypatch)
+    _faith_by_answer(monkeypatch, {"bad": 0.2, "better": 0.86})
     _collect()
 
-    assert calls == ["bad"], f"gate ran on the replacement too: {calls}"
+    gate = _gate(saved)
+    assert gate["verdict"] == "rejected"
+    assert gate["faithfulness"] == 0.86
+    assert gate["draft_faithfulness"] == 0.2
+    assert saved["metas"][0]["faithfulness"] == 0.86
+    assert saved["metas"][0]["draft_faithfulness"] == 0.2
+
+
+def test_a_rewrite_whose_check_fails_shows_no_score(monkeypatch):
+    _install(monkeypatch, answers=(["bad"], ["better"]), context_precision=0.8)
+    saved = _saved(monkeypatch)
+    _faith_by_answer(monkeypatch, {"bad": 0.2, "better": RuntimeError("judge down")})
+    _collect()
+
+    assert _gate(saved)["faithfulness"] is None
+    assert _gate(saved)["draft_faithfulness"] == 0.2
+    assert _gate(saved)["revised_answer"] == "better"
+
+
+def test_a_rewrite_whose_check_times_out_shows_no_score(monkeypatch):
+    from app.config import get_settings
+
+    _install(monkeypatch, answers=(["bad"], ["better"]), context_precision=0.8)
+    saved = _saved(monkeypatch)
+    _faith_by_answer(monkeypatch, {"bad": 0.2, "better": (1.5, 0.9)})
+    monkeypatch.setattr(get_settings(), "eval_timeout_seconds", 0.3)
+    _collect()
+
+    assert _gate(saved)["faithfulness"] is None
+    assert _gate(saved)["draft_faithfulness"] == 0.2
+
+
+def test_a_low_scoring_rewrite_is_not_rewritten_again(monkeypatch):
+    """One rewrite, then the verdict stands - however the rewrite scores."""
+    client = _install(monkeypatch, answers=(["bad"], ["better"]), context_precision=0.8)
+    saved = _saved(monkeypatch)
+    calls = _faith_by_answer(monkeypatch, {"bad": 0.2, "better": 0.1})
+    _collect()
+
+    assert calls == ["bad", "better"]
+    assert client.chat.completions.calls == 2
+    assert _gate(saved)["faithfulness"] == 0.1
+
+
+def test_a_passed_answer_is_scored_once_and_has_no_draft_score(monkeypatch):
+    _install(monkeypatch, context_precision=0.8)
+    saved = _saved(monkeypatch)
+    calls = _faith_by_answer(monkeypatch, {"draft ": 0.9})
+    _collect()
+
+    assert calls == ["draft "]
+    assert _gate(saved)["draft_faithfulness"] is None
 
 
 def test_the_final_answer_is_scored_in_the_background(monkeypatch):

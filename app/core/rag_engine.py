@@ -481,6 +481,30 @@ def _finished_result(metric: asyncio.Future) -> float | None:
     return metric.result()
 
 
+async def _score_rewrite(question: str, text: str, context_chunks: list[str],
+                         trace_id: str) -> float | None:
+    """Faithfulness of a rewrite, or None if the check fails or overruns.
+
+    Faithfulness only: the rewrite is not gated again, so its score is
+    reported rather than acted on, and precision would not change - the
+    contexts are the same.
+    """
+    settings = get_settings()
+    scored = _truncate_on_boundary(text, settings.eval_max_answer_chars)
+    metric: asyncio.Future | None = None
+    try:
+        async with _EVAL_SLOTS:
+            metric = asyncio.ensure_future(_run_metric(
+                evaluate_faithfulness_sync, question, scored, context_chunks))
+            _, late = await asyncio.wait([metric], timeout=settings.eval_timeout_seconds)
+        if late:
+            logger.warning("rewrite_score_timed_out", trace_id=trace_id)
+        return _finished_result(metric)
+    finally:
+        if metric is not None and not metric.done():
+            metric.cancel()
+
+
 def _truncate_on_boundary(text: str, limit: int) -> str:
     """Cut `text` to at most `limit` characters, ending at a sentence or word.
 
@@ -604,7 +628,7 @@ async def _run_gate(*, trace, question: str, answer: str, context_text: str,
     settings = get_settings()
     threshold = settings.eval_quality_threshold
     result = {"verdict": VERDICT_UNSCORED, "faithfulness": None, "context_precision": None,
-              "threshold": threshold, "revised_answer": None}
+              "threshold": threshold, "revised_answer": None, "draft_faithfulness": None}
     final_answer, final_attempt = answer, 1
     spans: list = []
     try:
@@ -673,12 +697,18 @@ async def _run_gate(*, trace, question: str, answer: str, context_text: str,
             regen_span.end()
             spans.remove(regen_span)
 
-            # Not gated again: it is scored in the background like every
-            # other answer. An empty rewrite (a content filter, an empty
-            # completion) must not replace a draft that was at least readable.
+            # An empty rewrite (a content filter, an empty completion) must
+            # not replace a draft that was at least readable.
             if replacement["text"].strip():
                 result["revised_answer"] = replacement["text"]
                 final_answer, final_attempt = replacement["text"], 2
+                # The badge shows `faithfulness`, so after a rewrite it must be
+                # the rewrite's own - never the rejected draft's. The draft's
+                # stays for the rejection reason.
+                result["draft_faithfulness"] = faithfulness
+                result["faithfulness"] = None   # if the check itself crashes
+                result["faithfulness"] = await _score_rewrite(
+                    question, replacement["text"], context_chunks, trace.id)
             else:
                 logger.warning("regeneration_empty_keeping_draft", trace_id=trace.id)
         elif verdict == VERDICT_RETRIEVAL_FAILED:
@@ -698,6 +728,7 @@ async def _run_gate(*, trace, question: str, answer: str, context_text: str,
                 "passed": result["verdict"] == VERDICT_PASSED,
                 "verdict": result["verdict"],
                 "attempt": final_attempt,
+                "draft_faithfulness": result["draft_faithfulness"],
             })
         except Exception:
             logger.exception("gate_result_not_saved", trace_id=trace.id)
