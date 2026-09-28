@@ -436,6 +436,13 @@ async def _run_metric(fn, *args):
     return await loop.run_in_executor(_EVAL_EXECUTOR, fn, *args)
 
 
+def _finished_result(metric: asyncio.Future) -> float | None:
+    """The metric's score if it finished cleanly in time, otherwise None."""
+    if not metric.done() or metric.cancelled() or metric.exception() is not None:
+        return None
+    return metric.result()
+
+
 def _truncate_on_boundary(text: str, limit: int) -> str:
     """Cut `text` to at most `limit` characters, ending at a sentence or word.
 
@@ -672,37 +679,40 @@ async def ask_stream(
         # overlap each other: the gate costs max(faithfulness, precision) rather
         # than their sum, and the whole thing is off the reader's path anyway.
         #
-        # return_exceptions keeps one metric's failure from discarding the other's
-        # result - notably on timeout, where a score that finished at 118s should
-        # not be thrown away with the one that did not.
+        # Each metric is kept or dropped on its own. On timeout, a score that
+        # finished at 20s is kept even though the other is still running;
+        # wait_for(gather(...)) cancelled both and threw it away. Precision is
+        # the one that overruns - it makes a judge call per retrieved context.
         faithfulness = context_precision = None
+        metrics: list[asyncio.Future] = []
         try:
             async with _EVAL_SLOTS:
-                results = await asyncio.wait_for(
-                    asyncio.gather(
-                        _run_metric(evaluate_faithfulness_sync, question, scored_text, context_chunks),
-                        _run_metric(evaluate_context_precision_sync, question, context_chunks, scored_text),
-                        return_exceptions=True,
-                    ),
-                    timeout=settings.eval_timeout_seconds,
-                )
-            faithfulness, context_precision = (
-                None if isinstance(r, BaseException) else r for r in results
-            )
+                metrics = [
+                    asyncio.ensure_future(_run_metric(
+                        evaluate_faithfulness_sync, question, scored_text, context_chunks)),
+                    asyncio.ensure_future(_run_metric(
+                        evaluate_context_precision_sync, question, context_chunks, scored_text)),
+                ]
+                _, late = await asyncio.wait(metrics, timeout=settings.eval_timeout_seconds)
+            if late:
+                logger.warning("eval_metric_timed_out", late=len(late), trace_id=trace.id)
+            faithfulness, context_precision = (_finished_result(m) for m in metrics)
         except Exception as exc:
-            # Covers the timeout too (asyncio.TimeoutError is an Exception), but
-            # deliberately NOT asyncio.CancelledError, which is a BaseException
+            # Deliberately NOT asyncio.CancelledError, which is a BaseException
             # and means the reader disconnected - that should propagate.
             #
             # A gate that fails must never cost the reader the answer they can
             # already see. Report it as unscored and keep the draft.
-            #
-            # Note: asyncio.to_thread cannot be cancelled, so on timeout the
-            # ragas call keeps running to completion in its worker thread. It is
-            # abandoned, not killed; it holds one thread until it finishes.
             logger.warning("faithfulness_gate_unavailable",
                            error=f"{type(exc).__name__}: {exc}", trace_id=trace.id)
             faithfulness = None
+        finally:
+            # A metric's thread cannot be cancelled: a late ragas call runs to
+            # completion in its worker, abandoned rather than killed. Cancelling
+            # the future just stops anyone waiting on it.
+            for metric in metrics:
+                if not metric.done():
+                    metric.cancel()
 
         threshold = settings.eval_quality_threshold
         verdict = _decide_verdict(faithfulness, context_precision, threshold)

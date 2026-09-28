@@ -221,6 +221,26 @@ def test_a_raising_gate_keeps_the_draft(monkeypatch):
     assert events[-1]["final_attempt"] == 1
 
 
+def test_a_slow_precision_metric_does_not_discard_a_finished_faithfulness(monkeypatch):
+    """Precision makes one judge call per context - twelve now, not five - so
+    it is the metric that overruns. The timeout used to cancel both and call
+    the answer unscored, though faithfulness had finished long before."""
+    import time
+
+    from app.config import get_settings
+
+    _install(monkeypatch, faithfulness=0.9)
+    monkeypatch.setattr(engine, "evaluate_context_precision_sync",
+                        lambda question, contexts, answer: time.sleep(1.5) or 0.8)
+    monkeypatch.setattr(get_settings(), "eval_timeout_seconds", 0.3)
+
+    evals = [e for e in _collect() if e["type"] == "eval"]
+
+    assert evals[0]["verdict"] == "passed"
+    assert evals[0]["scores"]["faithfulness"] == 0.9
+    assert evals[0]["scores"]["context_precision"] is None
+
+
 def test_the_regenerated_answer_is_not_scored_before_done(monkeypatch):
     """The uninstrumented ~74s second faithfulness call is gone."""
     calls = []
