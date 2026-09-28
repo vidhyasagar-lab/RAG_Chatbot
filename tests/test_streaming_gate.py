@@ -16,6 +16,7 @@ import asyncio
 import json
 
 import pytest
+from langchain_core.documents import Document
 
 import app.core.rag_engine as engine
 
@@ -92,16 +93,18 @@ def _install(
     answers=(["draft "], ["final answer"]),
     faithfulness=0.9,
     context_precision=0.8,
+    followups=(),
 ):
     """Point the engine at fakes; return the client so calls can be counted."""
     client = _FakeClient(answers)
     monkeypatch.setattr(engine, "_get_async_client", lambda: client)
     monkeypatch.setattr(
-        engine, "_build_context",
-        lambda q, top_k=None, user_id="": ("ctx text", [{"source": "d.pdf", "page": 1,
-                                                        "chunk_index": 0,
-                                                        "content_type": "text"}], []),
+        engine, "hybrid_search",
+        lambda q, k=None, user_id="": [Document(
+            page_content="ctx text",
+            metadata={"source": "d.pdf", "page": 1, "content_type": "text"})],
     )
+    monkeypatch.setattr(engine, "plan_followups", lambda q, docs: list(followups))
 
     def _faith(question, answer, contexts):
         if isinstance(faithfulness, Exception):
@@ -437,6 +440,22 @@ def test_leaving_mid_draft_does_not_start_a_replacement(monkeypatch):
     _leave_when(monkeypatch, lambda e: e["type"] == "token" and e["attempt"] == 1)
 
     assert client.chat.completions.calls == 1
+
+
+def test_a_second_search_is_announced_before_the_sources(monkeypatch):
+    """The wait is explained, and the sources shown include round two's."""
+    _install(monkeypatch, followups=["ranking table"])
+    events = _collect()
+    types = _types(events)
+
+    searching = [i for i, e in enumerate(events) if e.get("stage") == "searching"]
+    assert len(searching) == 1
+    assert searching[0] < types.index("meta")
+
+
+def test_no_second_search_means_no_searching_stage(monkeypatch):
+    _install(monkeypatch)
+    assert all(e.get("stage") != "searching" for e in _collect())
 
 
 def test_stage_events_describe_the_phase(monkeypatch):

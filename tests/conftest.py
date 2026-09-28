@@ -70,6 +70,18 @@ def _stub_embeddings():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_followup_calls(monkeypatch):
+    """The follow-up check is an Azure call. Unless a test scripts it, it
+    fails - and a failing check leaves retrieval as it was."""
+    import app.core.followup as followup
+
+    def unreachable():
+        raise RuntimeError("tests never reach Azure")
+
+    monkeypatch.setattr(followup, "_get_client", unreachable)
+
+
 @pytest.fixture(scope="session")
 def client(_stub_embeddings):
     """A TestClient with the app lifespan run (startup + shutdown)."""

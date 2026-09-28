@@ -137,6 +137,10 @@ class Settings(BaseSettings):
     # Parent expansion lets 12 results reach ~6,000 tokens; the lowest-ranked
     # are trimmed beyond this, but the top result is always kept.
     max_context_tokens: int = 6000
+    # One bounded extra search when round one misses part of the question.
+    followup_retrieval_enabled: bool = True
+    followup_timeout_seconds: float = 8.0
+    followup_max_queries: int = 3
     dense_weight: float = 0.5
     sparse_weight: float = 0.5
 

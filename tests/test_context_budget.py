@@ -55,7 +55,7 @@ def test_an_oversized_first_result_is_still_kept():
 
 def test_build_context_applies_the_budget(monkeypatch):
     docs = [_doc(100, "first"), _doc(100, "second")]
-    monkeypatch.setattr(engine, "hybrid_search", lambda *a, **kw: docs)
+    monkeypatch.setattr(engine, "retrieve_with_followup", lambda *a, **kw: docs)
     monkeypatch.setattr(get_settings(), "max_context_tokens", 120)
 
     text, sources, _ = engine._build_context("q", user_id="u")

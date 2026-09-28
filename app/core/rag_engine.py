@@ -23,6 +23,7 @@ from app.core.evaluator import (
     evaluate_faithfulness_sync,
     evaluate_query_async,
 )
+from app.core.followup import fuse_rounds, plan_followups, retrieve_with_followup
 from app.core.logging import get_logger
 from app.core.observability import create_trace
 from app.core.vector_store import hybrid_search
@@ -178,7 +179,7 @@ def _build_context(query: str, top_k: int | None = None, user_id: str = "") -> t
     Returns ``(context_text, sources, images)`` where images contains
     paths to visual elements referenced by retrieved chunks.
     """
-    docs = hybrid_search(query, k=top_k, user_id=user_id)
+    docs = retrieve_with_followup(query, k=top_k, user_id=user_id)
     return _format_context(_apply_budget(docs, get_settings().max_context_tokens))
 
 
@@ -582,9 +583,26 @@ async def ask_stream(
 
     try:
         # ── Retrieval ────────────────────────────────────────────────
+        # Off the event loop: embedding the query and the follow-up check are
+        # network calls, and running them inline stalled every other request.
+        # Done step by step rather than through retrieve_with_followup so the
+        # reader can be told when a second search is costing them time.
         retrieval_span = _opened(trace.span(name="retrieval", input={"query": question, "top_k": top_k}))
-        context_text, sources, images = _build_context(question, top_k, user_id=user_id)
-        retrieval_span.update(output={"sources_count": len(sources), "images_count": len(images)})
+        k = top_k or settings.top_k_results
+
+        def search(query: str) -> list[Document]:
+            return hybrid_search(query, k=k, user_id=user_id)
+
+        docs = await asyncio.to_thread(search, question)
+        queries = await asyncio.to_thread(plan_followups, question, docs)
+        if queries:
+            yield _sse({"type": "stage", "stage": "searching", "attempt": 1})
+            extra = [await asyncio.to_thread(search, q) for q in queries]
+            docs = fuse_rounds(docs, extra, k)
+        context_text, sources, images = _format_context(
+            _apply_budget(docs, settings.max_context_tokens))
+        retrieval_span.update(output={"sources_count": len(sources), "images_count": len(images),
+                                      "followup_queries": queries})
         _close(retrieval_span)
 
         yield _sse({
