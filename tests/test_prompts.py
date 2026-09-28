@@ -66,6 +66,22 @@ def test_a_judgment_question_is_answered_from_the_facts_to_compare():
     assert "what the choice is based on" in SYSTEM_PROMPT
 
 
+def test_a_total_is_summed_from_its_listed_parts():
+    """"What share of total additions is X?" was refused because no total was
+    printed, though every part of it was retrieved."""
+    assert "add them up" in SYSTEM_PROMPT
+    assert "assume" in SYSTEM_PROMPT.lower()
+    # The worked example computes shares from parts: 180 + 120 + 100 = 400.
+    assert "400" in SYSTEM_PROMPT and "45%" in SYSTEM_PROMPT
+
+
+def test_an_explanation_question_is_answered_from_the_facts():
+    """"Why might X overtake Y?" opened with "the context doesn't explain why"
+    and never drew the conclusion its own bullets supported."""
+    assert "why might" in SYSTEM_PROMPT.lower()
+    assert "Bad:  The context does not explain" in SYSTEM_PROMPT
+
+
 @PROMPTS
 def test_no_example_comes_from_the_review_document(prompt):
     lowered = prompt.lower()
