@@ -91,6 +91,54 @@ Extract all data from this table image. Return it as:
 
 Be precise with numbers, dates, and labels."""
 
+# One prompt that lets the model, which can see the figure, choose the rules.
+# Guessing the type from surrounding text failed badly on DOCX: substring
+# matches ("no" in "economic", "flow" in "Capital Flows") sent charts to the
+# flowchart prompt, and the text around a figure rarely says what it is.
+ADAPTIVE_VISION_PROMPT = """\
+You are a document analysis assistant describing one figure from a document \
+for a searchable knowledge base.
+
+First line, exactly: Type: <chart|flowchart|diagram|table|image>
+- chart: any plot or graph - bar, line, area, pie, scatter, bubble, heatmap,
+  radar, box plot.
+- flowchart: a process or decision flow.
+- diagram: architecture, network, organisation, or other components with
+  connections.
+- table: a grid of values.
+- image: photos, illustrations, logos, and anything else.
+
+Then describe the figure by the rules for its type:
+- chart: chart type and title; axes labels and units; every series with its
+  values, as precisely as they can be read; legend and annotations; key trends
+  and comparisons.
+- flowchart: every step with its label; flow direction and every connection;
+  decision points and their branches; loops and parallel paths.
+- diagram: every component with its label; relationships and connections and
+  their direction; groupings, layers and boundaries; any legend.
+- table: the whole table in Markdown, every row and column exactly; then a
+  one-line summary.
+- image: all visible text transcribed exactly; what the image shows.
+
+Be precise with numbers, labels and units - the description is what search
+will find."""
+
+_FIGURE_TYPES = ("chart", "flowchart", "diagram", "table", "image")
+_TYPE_LINE = re.compile(r"^\W*type\W*:\W*([a-z]+)\W*$", re.IGNORECASE)
+
+
+def _split_type_line(description: str) -> tuple[str | None, str]:
+    """Read the "Type: chart" line the adaptive prompt asks for.
+
+    Returns (type, the rest) when the first line names a known type, and
+    (None, the description unchanged) otherwise.
+    """
+    first, _, rest = description.strip().partition("\n")
+    match = _TYPE_LINE.match(first.strip())
+    if match and match.group(1).lower() in _FIGURE_TYPES:
+        return match.group(1).lower(), rest.strip()
+    return None, description
+
 
 # ── Data classes ──────────────────────────────────────────────────────
 
@@ -134,6 +182,9 @@ class _PendingVisual:
     element_index: int  # index into result.visual_elements
     doc_index: int  # index into result.text_docs
     drop_if_blank: bool = False  # discard the record if the description is empty
+    # The model names the figure's type on a first line; `header` then holds
+    # a {kind} placeholder filled from it.
+    classify: bool = False
 
 
 def _resolve_pending_visuals(
@@ -157,6 +208,13 @@ def _resolve_pending_visuals(
             logger.warning(log_event, path=p.image_path, error=str(error))
             description = p.fallback
         description = description or ""
+        header = p.header
+        if p.classify:
+            kind, description = _split_type_line(description)
+            kind = kind or "image"
+            result.visual_elements[p.element_index].content_type = kind
+            result.text_docs[p.doc_index].metadata["content_type"] = kind
+            header = header.format(kind=kind.title())
 
         if p.drop_if_blank and not description.strip():
             drop_docs.add(p.doc_index)
@@ -164,7 +222,7 @@ def _resolve_pending_visuals(
             continue
 
         result.visual_elements[p.element_index].description = description
-        result.text_docs[p.doc_index].page_content = f"{p.header}\n{description}"
+        result.text_docs[p.doc_index].page_content = f"{header}\n{description}"
 
     if drop_docs or drop_elements:
         result.text_docs[:] = [
@@ -188,6 +246,7 @@ def _defer_description(
     fallback: str,
     metadata: dict,
     drop_if_blank: bool = False,
+    classify: bool = False,
 ) -> None:
     """Append placeholder records and queue the image for description."""
     result.visual_elements.append(VisualElement(
@@ -206,6 +265,7 @@ def _defer_description(
         element_index=len(result.visual_elements) - 1,
         doc_index=len(result.text_docs) - 1,
         drop_if_blank=drop_if_blank,
+        classify=classify,
     ))
 
 
@@ -465,15 +525,15 @@ def preprocess_docx(file_path: str) -> PreprocessedDocument:
     def breadcrumb() -> str:
         return " > ".join(text for _, text in headings)
 
-    def emit_image(rid: str, surrounding: str, section: str) -> None:
+    def emit_image(rid: str, section: str) -> None:
         part = docx.part.related_parts.get(rid)
         if part is None or not hasattr(part, "blob"):
             return
         counters["image"] += 1
         _emit_docx_image(result, pending, part, counters["image"], file_path,
-                         output_dir, stem, surrounding, section)
+                         output_dir, stem, section)
 
-    for i, block in enumerate(blocks):
+    for block in blocks:
         if isinstance(block, Paragraph):
             text = block.text.strip()
             level = _heading_level(block)
@@ -491,14 +551,14 @@ def preprocess_docx(file_path: str) -> PreprocessedDocument:
         for rid in block._element.xpath(".//a:blip/@r:embed"):
             if rid not in placed:
                 placed.add(rid)
-                emit_image(rid, _neighbour_text(blocks, i), breadcrumb())
+                emit_image(rid, breadcrumb())
 
     # Images the body never places (unreferenced, or only in a text box the
     # walk cannot see) are still extracted, as before, just without a heading.
     for rid, rel in docx.part.rels.items():
         if "image" in rel.reltype and rid not in placed:
             placed.add(rid)
-            emit_image(rid, "", "")
+            emit_image(rid, "")
 
     # SmartArt / embedded objects
     _extract_docx_smartart(docx, file_path, output_dir, stem, result, pending)
@@ -533,14 +593,6 @@ def _heading_level(para) -> int | None:
     return int(level) if level.isdigit() else 1
 
 
-def _neighbour_text(blocks: list, index: int, reach: int = 3) -> str:
-    """Paragraph text around a block, used to guess what a figure shows."""
-    from docx.text.paragraph import Paragraph
-
-    near = blocks[max(0, index - reach): index + reach + 1]
-    return " ".join(b.text for b in near if isinstance(b, Paragraph) and b.text.strip())
-
-
 def _with_section(metadata: dict, section: str) -> dict:
     if section:
         metadata["section_header"] = section
@@ -568,7 +620,7 @@ def _emit_docx_table(result: PreprocessedDocument, table, number: int,
 
 def _emit_docx_image(result: PreprocessedDocument, pending: list[_PendingVisual],
                      image_part, number: int, file_path: str, output_dir: Path,
-                     stem: str, surrounding: str, section: str) -> None:
+                     stem: str, section: str) -> None:
     try:
         image_bytes = image_part.blob
         # Skip tiny images (bullets, decorations)
@@ -579,22 +631,23 @@ def _emit_docx_image(result: PreprocessedDocument, pending: list[_PendingVisual]
         img_path = output_dir / f"{stem}_img{number}.{ext}"
         img_path.write_bytes(image_bytes)
 
-        visual_type = _classify_visual(surrounding)
+        # "image" until the model names the type; see ADAPTIVE_VISION_PROMPT.
         _defer_description(
             result, pending,
-            content_type=visual_type,
+            content_type="image",
             source=file_path,
             page="",
             image_path=str(img_path),
-            prompt=_get_vision_prompt(visual_type),
-            header=f"[{visual_type.title()} {number}]",
-            fallback=f"[{visual_type} — image {number}]",
+            prompt=ADAPTIVE_VISION_PROMPT,
+            header=f"[{{kind}} {number}]",
+            fallback=f"[figure — image {number}]",
             metadata=_with_section({
                 "source": file_path,
                 "page": "",
-                "content_type": visual_type,
+                "content_type": "image",
                 "image_path": str(img_path),
             }, section),
+            classify=True,
         )
     except Exception:
         logger.exception("docx_image_extract_failed", index=number)
