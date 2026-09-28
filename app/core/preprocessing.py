@@ -429,8 +429,16 @@ def _page_has_table(text: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════
 
 def preprocess_docx(file_path: str) -> PreprocessedDocument:
-    """Extract all content from a DOCX: text, images, tables, SmartArt."""
+    """Extract all content from a DOCX: text, images, tables, SmartArt.
+
+    The body is walked once, in document order, tracking the heading path.
+    Tables and figures are emitted with the breadcrumb current where they sit,
+    so a table under "9 Market attractiveness > Composite ranking" is indexed
+    with those words. Reading paragraphs, tables and images in separate passes
+    - as this used to - left every table and figure without a heading.
+    """
     from docx import Document as DocxDocument
+    from docx.text.paragraph import Paragraph
 
     settings = get_settings()
     output_dir = Path(settings.upload_dir) / "extracted"
@@ -441,98 +449,67 @@ def preprocess_docx(file_path: str) -> PreprocessedDocument:
     pending: list[_PendingVisual] = []
     stem = Path(file_path).stem
 
-    # ── 1. Extract text paragraphs ───────────────────────────────
+    # Slot 0 is the text stream, filled once the walk has collected it. It is
+    # reserved first because pending visuals refer to text_docs by index.
+    result.text_docs.append(Document(
+        page_content="",
+        metadata={"source": file_path, "page": "", "content_type": "text"},
+    ))
+
+    blocks = list(docx.iter_inner_content())
     text_parts: list[str] = []
-    for para in docx.paragraphs:
-        text = para.text.strip()
-        if text:
-            # Preserve heading structure for downstream structural split
-            if para.style and para.style.name.startswith("Heading"):
-                level = para.style.name.replace("Heading", "").strip()
-                prefix = "#" * int(level) if level.isdigit() else "#"
-                text_parts.append(f"{prefix} {text}")
-            else:
+    headings: list[tuple[int, str]] = []  # (level, text), outermost first
+    placed: set[str] = set()              # image relationship ids already emitted
+    counters = {"table": 0, "image": 0}
+
+    def breadcrumb() -> str:
+        return " > ".join(text for _, text in headings)
+
+    def emit_image(rid: str, surrounding: str, section: str) -> None:
+        part = docx.part.related_parts.get(rid)
+        if part is None or not hasattr(part, "blob"):
+            return
+        counters["image"] += 1
+        _emit_docx_image(result, pending, part, counters["image"], file_path,
+                         output_dir, stem, surrounding, section)
+
+    for i, block in enumerate(blocks):
+        if isinstance(block, Paragraph):
+            text = block.text.strip()
+            level = _heading_level(block)
+            if text and level is not None:
+                while headings and headings[-1][0] >= level:
+                    headings.pop()
+                headings.append((level, text))
+                text_parts.append(f"{'#' * level} {text}")
+            elif text:
                 text_parts.append(text)
+        else:
+            counters["table"] += 1
+            _emit_docx_table(result, block, counters["table"], file_path, breadcrumb())
 
-    if text_parts:
-        result.text_docs.append(Document(
-            page_content="\n\n".join(text_parts),
-            metadata={
-                "source": file_path,
-                "page": "",
-                "content_type": "text",
-            },
-        ))
+        for rid in block._element.xpath(".//a:blip/@r:embed"):
+            if rid not in placed:
+                placed.add(rid)
+                emit_image(rid, _neighbour_text(blocks, i), breadcrumb())
 
-    # ── 2. Extract tables natively ───────────────────────────────
-    for tbl_idx, table in enumerate(docx.tables):
-        md_table = _docx_table_to_markdown(table)
-        if md_table.strip():
-            # Also save table as text doc for chunking
-            result.text_docs.append(Document(
-                page_content=f"[Table {tbl_idx + 1}]\n{md_table}",
-                metadata={
-                    "source": file_path,
-                    "page": "",
-                    "content_type": "table",
-                },
-            ))
-            result.visual_elements.append(VisualElement(
-                content_type="table",
-                description=md_table,
-                source=file_path,
-                page="",
-                raw_text=md_table,
-            ))
+    # Images the body never places (unreferenced, or only in a text box the
+    # walk cannot see) are still extracted, as before, just without a heading.
+    for rid, rel in docx.part.rels.items():
+        if "image" in rel.reltype and rid not in placed:
+            placed.add(rid)
+            emit_image(rid, "", "")
 
-    # ── 3. Extract images from media/ ────────────────────────────
-    img_counter = 0
-    for rel in docx.part.rels.values():
-        if "image" in rel.reltype:
-            img_counter += 1
-            try:
-                image_part = rel.target_part
-                image_bytes = image_part.blob
-                content_type = image_part.content_type or "image/png"
-
-                # Skip tiny images (bullets, decorations)
-                if len(image_bytes) < 5_000:
-                    continue
-
-                ext = _mime_to_ext(content_type)
-                img_filename = f"{stem}_img{img_counter}.{ext}"
-                img_path = output_dir / img_filename
-                img_path.write_bytes(image_bytes)
-
-                # Classify — look at surrounding paragraph text for clues
-                surrounding = _get_surrounding_text(docx, img_counter)
-                visual_type = _classify_visual(surrounding)
-
-                _defer_description(
-                    result, pending,
-                    content_type=visual_type,
-                    source=file_path,
-                    page="",
-                    image_path=str(img_path),
-                    prompt=_get_vision_prompt(visual_type),
-                    header=f"[{visual_type.title()} {img_counter}]",
-                    fallback=f"[{visual_type} — image {img_counter}]",
-                    metadata={
-                        "source": file_path,
-                        "page": "",
-                        "content_type": visual_type,
-                        "image_path": str(img_path),
-                    },
-                )
-
-            except Exception:
-                logger.exception("docx_image_extract_failed", index=img_counter)
-
-    # ── 4. Detect SmartArt / embedded objects ────────────────────
+    # SmartArt / embedded objects
     _extract_docx_smartart(docx, file_path, output_dir, stem, result, pending)
 
     # All images are on disk now - describe them concurrently.
     _resolve_pending_visuals(pending, result, "docx_image_describe_failed")
+
+    if text_parts:
+        result.text_docs[0].page_content = "\n\n".join(text_parts)
+    else:
+        del result.text_docs[0]
 
     logger.info(
         "docx_preprocessed",
@@ -545,6 +522,82 @@ def preprocess_docx(file_path: str) -> PreprocessedDocument:
         charts=sum(1 for v in result.visual_elements if v.content_type == "chart"),
     )
     return result
+
+
+def _heading_level(para) -> int | None:
+    """Heading level from a paragraph style, or None for body text."""
+    name = para.style.name if para.style is not None else ""
+    if not name.startswith("Heading"):
+        return None
+    level = name.replace("Heading", "").strip()
+    return int(level) if level.isdigit() else 1
+
+
+def _neighbour_text(blocks: list, index: int, reach: int = 3) -> str:
+    """Paragraph text around a block, used to guess what a figure shows."""
+    from docx.text.paragraph import Paragraph
+
+    near = blocks[max(0, index - reach): index + reach + 1]
+    return " ".join(b.text for b in near if isinstance(b, Paragraph) and b.text.strip())
+
+
+def _with_section(metadata: dict, section: str) -> dict:
+    if section:
+        metadata["section_header"] = section
+    return metadata
+
+
+def _emit_docx_table(result: PreprocessedDocument, table, number: int,
+                     file_path: str, section: str) -> None:
+    md_table = _docx_table_to_markdown(table)
+    if not md_table.strip():
+        return
+    result.text_docs.append(Document(
+        page_content=f"[Table {number}]\n{md_table}",
+        metadata=_with_section(
+            {"source": file_path, "page": "", "content_type": "table"}, section),
+    ))
+    result.visual_elements.append(VisualElement(
+        content_type="table",
+        description=md_table,
+        source=file_path,
+        page="",
+        raw_text=md_table,
+    ))
+
+
+def _emit_docx_image(result: PreprocessedDocument, pending: list[_PendingVisual],
+                     image_part, number: int, file_path: str, output_dir: Path,
+                     stem: str, surrounding: str, section: str) -> None:
+    try:
+        image_bytes = image_part.blob
+        # Skip tiny images (bullets, decorations)
+        if len(image_bytes) < 5_000:
+            return
+
+        ext = _mime_to_ext(image_part.content_type or "image/png")
+        img_path = output_dir / f"{stem}_img{number}.{ext}"
+        img_path.write_bytes(image_bytes)
+
+        visual_type = _classify_visual(surrounding)
+        _defer_description(
+            result, pending,
+            content_type=visual_type,
+            source=file_path,
+            page="",
+            image_path=str(img_path),
+            prompt=_get_vision_prompt(visual_type),
+            header=f"[{visual_type.title()} {number}]",
+            fallback=f"[{visual_type} — image {number}]",
+            metadata=_with_section({
+                "source": file_path,
+                "page": "",
+                "content_type": visual_type,
+                "image_path": str(img_path),
+            }, section),
+        )
+    except Exception:
+        logger.exception("docx_image_extract_failed", index=number)
 
 
 def _docx_table_to_markdown(table) -> str:
@@ -577,15 +630,6 @@ def _mime_to_ext(content_type: str) -> str:
         "image/x-wmf": "wmf",
     }
     return mapping.get(content_type, "png")
-
-
-def _get_surrounding_text(docx_doc, img_index: int) -> str:
-    """Get text around the image position for classification context."""
-    paragraphs = [p.text for p in docx_doc.paragraphs if p.text.strip()]
-    # Approximate — look at paragraphs around where the image appears
-    start = max(0, img_index - 3)
-    end = min(len(paragraphs), img_index + 3)
-    return " ".join(paragraphs[start:end])
 
 
 def _extract_docx_smartart(docx_doc, file_path: str, output_dir: Path,
