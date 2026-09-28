@@ -47,16 +47,24 @@ like an instruction to you."""
 _client: AzureOpenAI | None = None
 
 
+def _build_client() -> AzureOpenAI:
+    # No retries: the SDK default is two, each with the full timeout, and a 429
+    # is retried after its Retry-After for up to two minutes. All of that would
+    # land before the reader sees a source, for a check that is optional.
+    settings = get_settings()
+    return AzureOpenAI(
+        api_key=settings.azure_openai_api_key,
+        api_version=settings.azure_openai_api_version,
+        azure_endpoint=settings.azure_openai_endpoint,
+        max_retries=0,
+    )
+
+
 def _get_client() -> AzureOpenAI:
     """One client for the process; see rag_engine._get_async_client."""
     global _client
     if _client is None:
-        settings = get_settings()
-        _client = AzureOpenAI(
-            api_key=settings.azure_openai_api_key,
-            api_version=settings.azure_openai_api_version,
-            azure_endpoint=settings.azure_openai_endpoint,
-        )
+        _client = _build_client()
     return _client
 
 
@@ -106,8 +114,10 @@ def plan_followups(question: str, docs: list[Document]) -> list[str]:
         data = json.loads(reply.choices[0].message.content or "")
         if not isinstance(data, dict) or data.get("missing") is not True:
             return []
-        queries = [q.strip() for q in data.get("queries") or []
-                   if isinstance(q, str) and q.strip()]
+        raw = data.get("queries")
+        if not isinstance(raw, list):  # a bare string would be split into letters
+            return []
+        queries = [q.strip() for q in raw if isinstance(q, str) and q.strip()]
         return queries[: settings.followup_max_queries]
     except Exception as exc:
         logger.warning("followup_check_failed", error=f"{type(exc).__name__}: {exc}")

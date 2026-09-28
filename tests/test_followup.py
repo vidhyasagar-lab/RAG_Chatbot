@@ -62,6 +62,21 @@ def test_at_most_three_string_queries_are_used(monkeypatch):
     assert followup.plan_followups("q", FIRST) == ["a", "b", "c"]
 
 
+def test_a_string_instead_of_a_list_is_not_split_into_letters(monkeypatch):
+    """Iterating "ranking table" would search for "r", "a" and "n"."""
+    _check_replies(monkeypatch, json.dumps({"missing": True, "queries": "ranking table"}))
+
+    assert followup.plan_followups("q", FIRST) == []
+
+
+def test_the_client_never_retries():
+    """The SDK retries twice by default, and honours Retry-After on a 429 for
+    up to two minutes - all before the reader sees a single source."""
+    client = followup._build_client()
+
+    assert client.max_retries == 0
+
+
 def test_covered_means_no_followup(monkeypatch):
     _check_replies(monkeypatch, json.dumps({"missing": False, "queries": ["ignored"]}))
 
