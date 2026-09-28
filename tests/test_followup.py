@@ -169,10 +169,24 @@ def test_no_queries_means_the_first_round_unchanged(monkeypatch):
     assert searched == []
 
 
-def test_a_followup_hit_ranks_beside_the_first_round_top_hit():
-    first = [_doc(f"first {i}") for i in range(5)]
-    extra = _doc("the missing table")
+def test_a_followup_cannot_push_out_round_one_top_half():
+    """Equal-weight fusion keeps ranks 1..k/(n+1) of each list: with three
+    follow-ups, round one would keep only its top three, dropping an answer
+    it had at rank five whenever the check asked for more."""
+    first = [_doc(f"first {i}") for i in range(12)]
+    extras = [[_doc(f"extra {j}")] for j in range(3)]
 
-    fused = followup.fuse_rounds(first, [[extra]], k=12)
+    fused = followup.fuse_rounds(first, extras, k=12)
 
-    assert fused.index(extra) <= 1
+    assert fused[:6] == first[:6]
+
+
+def test_followup_hits_come_straight_after_the_protected_half():
+    """Next in line, so the token budget - which trims from the end - keeps them."""
+    first = [_doc(f"first {i}") for i in range(12)]
+    extras = [[_doc(f"extra {j}")] for j in range(3)]
+
+    fused = followup.fuse_rounds(first, extras, k=12)
+
+    assert {d.page_content for d in fused[6:9]} == {"extra 0", "extra 1", "extra 2"}
+    assert len(fused) == 12

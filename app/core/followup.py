@@ -125,14 +125,21 @@ def plan_followups(question: str, docs: list[Document]) -> list[str]:
 
 
 def fuse_rounds(first: list[Document], extra: list[list[Document]], k: int) -> list[Document]:
-    """Merge round one with each follow-up list, all weighted equally.
+    """Keep round one's top half, then fill the rest by fusing every round.
 
-    Each list's top hit scores the same, so a follow-up's best result lands
-    beside round one's best instead of below everything round one found.
-    Fusion is keyed on content, so a chunk found twice appears once.
+    Plain equal-weight RRF keeps ranks 1..k/(n+1) of each list, so three
+    follow-ups would cut round one to its top three and drop an answer it had
+    found at rank five. The protected half stops that. In the remainder each
+    list's best hit scores the same, so the follow-ups' best results come
+    next - ahead of round one's tail, and so ahead of what the token budget
+    trims. Fusion is keyed on content, so a chunk found twice appears once.
     """
+    kept = first[: (k + 1) // 2]
+    seen = {d.page_content for d in kept}
     lists = [first, *extra]
-    return _reciprocal_rank_fusion(lists, weights=[1.0] * len(lists))[:k]
+    rest = [d for d in _reciprocal_rank_fusion(lists, weights=[1.0] * len(lists))
+            if d.page_content not in seen]
+    return (kept + rest)[:k]
 
 
 def retrieve_with_followup(
