@@ -94,18 +94,61 @@ class UserLoginRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=100, pattern=r"^[\w\-. ]+$")
 
 
+#: An address is the identifier for anyone signing up through the site, so
+#: that every account can be sent a code. Deliberately permissive: the real
+#: test of an address is whether its owner can read what we send there.
+EMAIL_PATTERN = r"^[^@\s]+@[^@\s.]+(\.[^@\s.]+)+$"
+
+
 class AuthCredentials(BaseModel):
     """Login/registration body.
 
-    The username pattern matches UserLoginRequest so the two cannot drift.
+    The identifier is an email address. It is still called ``username``
+    because that is the column, the cookie subject and the field every
+    existing client sends; renaming it would be a breaking change to the API
+    for a cosmetic gain.
+
+    The address requirement lives here, at the boundary where people sign
+    themselves up, rather than in ``register_user`` — the store is also used
+    by the admin CLI, which legitimately creates named service accounts that
+    are not addresses.
+
     Password has a floor but no ceiling-side rules here: the authoritative
     check is register_user's (>= 8 chars), and duplicating it would let the
     two disagree. min_length=1 only rejects an absent password outright so
     the 8-char message comes from one place.
     """
 
-    username: str = Field(..., min_length=1, max_length=100, pattern=r"^[\w\-. ]+$")
+    username: str = Field(..., min_length=3, max_length=254, pattern=EMAIL_PATTERN)
     password: str = Field(..., min_length=1, max_length=1024)
+
+
+class EmailCodeRequest(BaseModel):
+    """Ask for a sign-in code to be emailed."""
+
+    email: str = Field(..., min_length=3, max_length=254, pattern=EMAIL_PATTERN)
+
+
+class EmailCodeVerify(BaseModel):
+    """Redeem a code. Six digits, whitespace tolerated on the way in."""
+
+    email: str = Field(..., min_length=3, max_length=254, pattern=EMAIL_PATTERN)
+    code: str = Field(..., min_length=4, max_length=12)
+
+
+class EmailCodeSent(BaseModel):
+    """What the request endpoint admits to.
+
+    Never says whether the address has an account: that would turn this into
+    a way to find out who has one. ``delivered`` is false only when the
+    deployment is in development with no mail configured, where the code is
+    in the server log instead.
+    """
+
+    sent: bool = True
+    delivered: bool = True
+    expires_in_minutes: int
+    resend_in_seconds: int
 
 
 class AuthUserResponse(BaseModel):

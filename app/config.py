@@ -101,6 +101,39 @@ class Settings(BaseSettings):
     # in-source default. Validated below.
     secret_key: str = Field(repr=False)
 
+    # Sign-in by emailed code. Plain SMTP rather than one provider's SDK, so
+    # Brevo, Gmail, SES or anything else is a change to .env and nothing else.
+    # Unset in development means codes are logged instead of sent; unset in
+    # production makes the endpoint answer 503 rather than pretend to send.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = Field("", repr=False)
+    smtp_password: str = Field("", repr=False)
+    smtp_starttls: bool = True
+    # The From: address. Must be one the provider has authorised, or mail is
+    # silently dropped. Falls back to smtp_user, which is usually the same.
+    mail_from: str = ""
+    mail_from_name: str = "Verity"
+
+    @property
+    def effective_mail_from(self) -> str:
+        return self.mail_from or self.smtp_user
+
+    @property
+    def email_sending_configured(self) -> bool:
+        return bool(self.smtp_host and self.effective_mail_from)
+
+    # How long a code is good for, how long before another can be sent, and
+    # how many wrong guesses end the attempt. Six digits is a million-wide
+    # space, which only holds up because of the attempt cap.
+    login_code_ttl_minutes: int = 10
+    login_code_resend_seconds: int = 60
+    login_code_max_attempts: int = 5
+    # A ceiling on how many codes this deployment will send in a day, so a
+    # script pointed at the request endpoint cannot run up the provider bill
+    # or get the sending address blocked for spam.
+    login_code_daily_cap: int = 200
+
     @field_validator("secret_key")
     @classmethod
     def _reject_weak_secret_key(cls, v: str) -> str:

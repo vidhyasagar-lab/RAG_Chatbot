@@ -135,6 +135,10 @@ _PUBLIC_PATHS = frozenset({
     "/api/v1/auth/login",
     "/api/v1/auth/register",
     "/api/v1/auth/logout",
+    # Signing in by emailed code is a way in, like login and register, so it
+    # cannot sit behind the API key without locking out every new visitor.
+    "/api/v1/auth/code/request",
+    "/api/v1/auth/code/verify",
     "/api/v1/health",
 })
 # No public prefixes: /static/ and /partials/ served the server-rendered UI,

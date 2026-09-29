@@ -168,7 +168,7 @@ def _foreign_session(other_user_id="victim-user-id"):
 def _login_fresh_user(client):
     import uuid
 
-    username = f"user_{uuid.uuid4().hex[:10]}"
+    username = f"user_{uuid.uuid4().hex[:10]}@example.test"
     client.cookies.clear()
     resp = client.post(
         "/api/v1/auth/register",
@@ -297,7 +297,16 @@ def test_no_route_hand_rolls_its_auth_check():
 
     guards = {require_authenticated_user, require_admin_user}
     # APIRoute.path already carries the router's prefix.
-    intentionally_public = {"/auth/login", "/auth/register", "/auth/logout"}
+    # Signing in cannot require being signed in. The code endpoints carry
+    # their own limits instead: a resend cooldown, an attempt cap, a daily
+    # ceiling, and the same lockout that guards passwords.
+    intentionally_public = {
+        "/auth/login",
+        "/auth/register",
+        "/auth/logout",
+        "/auth/code/request",
+        "/auth/code/verify",
+    }
 
     unguarded = []
     for router in (auth.router, chat.router, documents.router, feedback.router, admin.router):

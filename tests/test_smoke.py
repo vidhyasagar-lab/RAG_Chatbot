@@ -45,6 +45,6 @@ def test_no_html_is_served_anywhere(client):
 
 def test_auth_endpoints_are_json(client):
     """The replacements live under /api/v1/auth and speak JSON."""
-    resp = client.post("/api/v1/auth/login", json={"username": "nobody", "password": "x"})
+    resp = client.post("/api/v1/auth/login", json={"username": "nobody@example.test", "password": "x"})
     assert resp.status_code == 401
     assert "application/json" in resp.headers["content-type"]

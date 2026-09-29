@@ -98,7 +98,7 @@ def registered_user(client):
     """Register a fresh user and return (username, password)."""
     import uuid
 
-    username = f"user_{uuid.uuid4().hex[:10]}"
+    username = f"user_{uuid.uuid4().hex[:10]}@example.test"
     password = "correct-horse-battery"
     resp = client.post(
         "/api/v1/auth/register",

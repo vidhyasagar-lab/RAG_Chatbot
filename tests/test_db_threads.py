@@ -48,7 +48,7 @@ def _hammer(read, write) -> list[BaseException]:
 def test_user_lookups_from_many_threads_while_documents_are_written(client):
     from app.core.user_store import get_user, record_document, register_user
 
-    user = register_user(f"thr_{uuid.uuid4().hex[:10]}", "correct-horse-battery")
+    user = register_user(f"thr_{uuid.uuid4().hex[:10]}@example.test", "correct-horse-battery")
     errors = _hammer(
         read=lambda: get_user(user["user_id"]),
         write=lambda: record_document(user["user_id"], f"{uuid.uuid4().hex}.pdf", 10, 1),

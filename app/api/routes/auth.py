@@ -25,10 +25,30 @@ from app.core.auth import (
     require_authenticated_user,
     set_session_cookie,
 )
+from app.config import get_settings
+from app.core.login_codes import (
+    CodeRequestRefused,
+    discard_code,
+    issue_code,
+    normalise_email,
+    verify_code,
+)
 from app.core.logging import get_logger
+from app.core.mailer import EmailNotConfigured, send_login_code
 from app.core.quota import usage_for
-from app.core.user_store import authenticate_user, get_user_documents, register_user
-from app.models.schemas import AuthCredentials, AuthUserResponse
+from app.core.user_store import (
+    authenticate_user,
+    get_or_create_user_by_email,
+    get_user_documents,
+    register_user,
+)
+from app.models.schemas import (
+    AuthCredentials,
+    AuthUserResponse,
+    EmailCodeRequest,
+    EmailCodeSent,
+    EmailCodeVerify,
+)
 
 logger = get_logger(__name__)
 
@@ -95,6 +115,91 @@ async def register(credentials: AuthCredentials, response: Response) -> AuthUser
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     set_session_cookie(response, user["user_id"])
+    return _public_user(user)
+
+
+@router.post("/code/request", response_model=EmailCodeSent)
+async def request_code(body: EmailCodeRequest) -> EmailCodeSent:
+    """Email a one-time sign-in code to the address given.
+
+    The same answer comes back whether or not the address has an account.
+    Saying "no such user" here would let anyone check who has signed up, and
+    the flow does not need the distinction: a code verified for an unknown
+    address creates the account.
+
+    A send that fails gives the code's slot back, so a provider outage does
+    not leave the person inside the resend cooldown with nothing to type.
+    """
+    email = normalise_email(body.email)
+    settings = get_settings()
+
+    try:
+        code, ttl_minutes = issue_code(email)
+    except CodeRequestRefused as e:
+        raise HTTPException(
+            status_code=429,
+            detail=str(e),
+            headers={"Retry-After": str(e.retry_after)} if e.retry_after else None,
+        ) from e
+
+    try:
+        await send_login_code(email, code, ttl_minutes)
+    except EmailNotConfigured as e:
+        discard_code(email, refund=True)
+        logger.error("login_code_send_unconfigured", email=email)
+        raise HTTPException(
+            status_code=503,
+            detail="Sign-in codes are not available right now. Use your password instead.",
+        ) from e
+    except Exception as e:
+        discard_code(email, refund=True)
+        logger.exception("login_code_send_failed", email=email)
+        raise HTTPException(
+            status_code=502,
+            detail="That code could not be sent. Check the address, or try again in a moment.",
+        ) from e
+
+    return EmailCodeSent(
+        sent=True,
+        # False only in development with no SMTP configured, where the code
+        # went to the server log. The client says so rather than telling
+        # someone to check an inbox nothing was sent to.
+        delivered=settings.email_sending_configured,
+        expires_in_minutes=ttl_minutes,
+        resend_in_seconds=settings.login_code_resend_seconds,
+    )
+
+
+@router.post("/code/verify", response_model=AuthUserResponse)
+async def verify_code_and_sign_in(body: EmailCodeVerify, response: Response) -> AuthUserResponse:
+    """Redeem a code, then sign in — creating the account if it is new.
+
+    Reaching a correct code is proof the caller reads that mailbox, which is
+    the whole basis for the session handed out here, so there is no password
+    step and no separate registration call.
+    """
+    email = normalise_email(body.email)
+
+    # The same lockout that guards passwords, keyed by address. The attempt
+    # cap inside the code store kills one code; this stops someone burning
+    # through a fresh code every cooldown to keep guessing.
+    if not check_login_allowed(email):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts. Try again in 5 minutes.",
+            headers={"Retry-After": str(lockout_remaining(email))},
+        )
+
+    if not verify_code(email, body.code):
+        record_failed_login(email)
+        raise HTTPException(status_code=401, detail="That code is wrong or has expired.")
+
+    clear_failed_logins(email)
+    user, created = get_or_create_user_by_email(email)
+    logger.info("signed_in_with_code", user_id=user["user_id"], created=created)
+    set_session_cookie(response, user["user_id"])
+    if created:
+        response.status_code = 201
     return _public_user(user)
 
 

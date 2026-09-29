@@ -108,7 +108,7 @@ def test_an_unknown_trace_changes_nothing():
 @pytest.fixture
 def signed_in(client):
     client.cookies.clear()
-    name = f"gate_{uuid.uuid4().hex[:10]}"
+    name = f"gate_{uuid.uuid4().hex[:10]}@example.test"
     resp = client.post("/api/v1/auth/register",
                        json={"username": name, "password": "correct-horse-battery"})
     assert resp.status_code == 201

@@ -135,7 +135,7 @@ def _sse(payload: dict) -> str:
 
 def _register(client) -> str:
     client.cookies.clear()
-    username = f"q_{uuid.uuid4().hex[:10]}"
+    username = f"q_{uuid.uuid4().hex[:10]}@example.test"
     resp = client.post(
         "/api/v1/auth/register",
         json={"username": username, "password": "correct-horse-battery"},

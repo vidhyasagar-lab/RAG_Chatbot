@@ -16,7 +16,7 @@ HOUR = 60 * 60
 def _register(client) -> str:
     resp = client.post(
         "/api/v1/auth/register",
-        json={"username": f"idle_{uuid.uuid4().hex[:10]}", "password": "correct-horse-battery"},
+        json={"username": f"idle_{uuid.uuid4().hex[:10]}@example.test", "password": "correct-horse-battery"},
     )
     assert resp.status_code == 201, resp.text
     client.cookies.clear()
@@ -42,7 +42,7 @@ def _me(client, token: str):
 
 
 def test_login_cookie_lasts_the_idle_window_not_a_week(client):
-    username = f"idle_{uuid.uuid4().hex[:10]}"
+    username = f"idle_{uuid.uuid4().hex[:10]}@example.test"
     resp = client.post("/api/v1/auth/register", json={"username": username, "password": "correct-horse-battery"})
     client.cookies.clear()
     (cookie,) = _session_cookies(resp)

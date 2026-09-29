@@ -152,6 +152,67 @@ def get_user_by_username(username: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def get_or_create_user_by_email(email: str) -> tuple[dict[str, Any], bool]:
+    """Resolve an account for a verified address, creating it if new.
+
+    Returns ``(user, created)``. Only ever called once a code sent to that
+    address has come back correct, so arriving here is proof the caller
+    reads that mailbox — which is why there is no password and no separate
+    "register" step. Accounts made this way have an empty password_hash;
+    ``_verify_password`` fails closed on it, so the password route stays
+    shut until one is set.
+
+    The lock covers the check and the insert together: two codes verified at
+    the same moment would otherwise both see no row and both insert, and the
+    UNIQUE constraint would turn the loser into a 500.
+    """
+    conn = _get_conn()
+    email = email.strip().lower()
+    if not email:
+        raise ValueError("Email cannot be empty")
+
+    with _lock:
+        row = conn.execute(
+            "SELECT user_id, username, created_at, COALESCE(role, 'user') as role "
+            "FROM users WHERE username = ?",
+            (email,),
+        ).fetchone()
+        if row:
+            return dict(row), False
+
+        user_id = uuid.uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO users (user_id, username, password_hash, created_at) VALUES (?, ?, '', ?)",
+            (user_id, email, now),
+        )
+        conn.commit()
+        logger.info("user_created_by_email_code", user_id=user_id, username=email)
+        return {"user_id": user_id, "username": email, "created_at": now, "role": "user"}, True
+
+
+def has_password(user_id: str) -> bool:
+    """Whether this account can be signed into with a password at all."""
+    row = _get_conn().execute(
+        "SELECT password_hash FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    return bool(row and row["password_hash"])
+
+
+def set_password(user_id: str, password: str) -> None:
+    """Set or replace an account's password. Raises ValueError if too short."""
+    if not password or len(password) < 8:
+        raise ValueError("Password must be at least 8 characters")
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE user_id = ?",
+            (_hash_password(password), user_id),
+        )
+        conn.commit()
+    logger.info("password_set", user_id=user_id)
+
+
 def increment_exchanges(user_id: str) -> int:
     """Charge one exchange against this user's lifetime budget.
 

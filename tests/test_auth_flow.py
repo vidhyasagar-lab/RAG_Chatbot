@@ -8,7 +8,7 @@ import pytest
 
 
 def test_register_then_login(client):
-    username = f"user_{uuid.uuid4().hex[:10]}"
+    username = f"user_{uuid.uuid4().hex[:10]}@example.test"
     password = "correct-horse-battery"
 
     resp = client.post(
@@ -29,7 +29,7 @@ def test_register_then_login(client):
 
 
 def test_login_with_wrong_password_is_rejected(client):
-    username = f"user_{uuid.uuid4().hex[:10]}"
+    username = f"user_{uuid.uuid4().hex[:10]}@example.test"
     client.post(
         "/api/v1/auth/register",
         json={"username": username, "password": "correct-horse-battery"},
@@ -50,7 +50,7 @@ def test_login_does_not_reveal_whether_a_username_exists(client):
     The form handler this replaced returned one shared message; keeping that
     property is the whole reason login does not report "no such user".
     """
-    known = f"user_{uuid.uuid4().hex[:10]}"
+    known = f"user_{uuid.uuid4().hex[:10]}@example.test"
     client.post(
         "/api/v1/auth/register",
         json={"username": known, "password": "correct-horse-battery"},
@@ -62,7 +62,7 @@ def test_login_does_not_reveal_whether_a_username_exists(client):
     )
     unknown_user = client.post(
         "/api/v1/auth/login",
-        json={"username": f"user_{uuid.uuid4().hex[:10]}", "password": "wrong-password"},
+        json={"username": f"user_{uuid.uuid4().hex[:10]}@example.test", "password": "wrong-password"},
     )
     assert wrong_password.status_code == unknown_user.status_code == 401
     assert wrong_password.json() == unknown_user.json()
@@ -89,7 +89,7 @@ def test_register_reports_the_real_password_minimum(client):
     """
     resp = client.post(
         "/api/v1/auth/register",
-        json={"username": f"user_{uuid.uuid4().hex[:10]}", "password": "1234567"},
+        json={"username": f"user_{uuid.uuid4().hex[:10]}@example.test", "password": "1234567"},
     )
     assert resp.status_code == 400, resp.text
     assert "at least 8 characters" in resp.json()["detail"]
@@ -98,7 +98,7 @@ def test_register_reports_the_real_password_minimum(client):
 def test_duplicate_username_rejected():
     from app.core.user_store import register_user
 
-    username = f"user_{uuid.uuid4().hex[:10]}"
+    username = f"user_{uuid.uuid4().hex[:10]}@example.test"
     register_user(username, "correct-horse-battery")
     with pytest.raises(ValueError, match="already taken"):
         register_user(username, "another-good-password")
@@ -109,7 +109,7 @@ def test_duplicate_username_rejected():
 def test_lockout_after_repeated_failures():
     from app.core.auth import check_login_allowed, clear_failed_logins, record_failed_login
 
-    username = f"user_{uuid.uuid4().hex[:10]}"
+    username = f"user_{uuid.uuid4().hex[:10]}@example.test"
     assert check_login_allowed(username) is True
     for _ in range(5):
         record_failed_login(username)
@@ -122,7 +122,7 @@ def test_lockout_after_repeated_failures():
 def test_locked_out_login_returns_429_with_retry_after(client):
     """Even the right password is refused while locked, and the client is told
     when to retry instead of having to guess."""
-    username = f"user_{uuid.uuid4().hex[:10]}"
+    username = f"user_{uuid.uuid4().hex[:10]}@example.test"
     password = "correct-horse-battery"
     client.post("/api/v1/auth/register", json={"username": username, "password": password})
     client.cookies.clear()
@@ -151,7 +151,7 @@ def test_session_cookie_is_signed_and_tamper_evident():
 # ── HYG-4: logout clears with matching attributes ────────────────────────
 
 def test_logout_clears_the_session_cookie(client):
-    username = f"user_{uuid.uuid4().hex[:10]}"
+    username = f"user_{uuid.uuid4().hex[:10]}@example.test"
     client.post(
         "/api/v1/auth/register",
         json={"username": username, "password": "correct-horse-battery"},

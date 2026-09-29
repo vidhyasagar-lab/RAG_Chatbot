@@ -21,7 +21,7 @@ def _sign_in(client) -> str:
     client.cookies.clear()
     resp = client.post(
         "/api/v1/auth/register",
-        json={"username": f"fig_{uuid.uuid4().hex[:10]}", "password": "correct-horse-battery"},
+        json={"username": f"fig_{uuid.uuid4().hex[:10]}@example.test", "password": "correct-horse-battery"},
     )
     assert resp.status_code == 201, resp.text
     return client.get("/api/v1/auth/me").json()["user_id"]

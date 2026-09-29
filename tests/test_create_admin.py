@@ -10,7 +10,7 @@ PASSWORD = "correct-horse-battery"
 
 
 def _name() -> str:
-    return f"adm_{uuid.uuid4().hex[:10]}"
+    return f"adm_{uuid.uuid4().hex[:10]}@example.test"
 
 
 def _answers(monkeypatch, *replies):
