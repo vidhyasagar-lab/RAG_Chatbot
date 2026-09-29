@@ -30,6 +30,15 @@ os.environ.update(
     # make unrelated tests fail depending on execution order. Limiting itself
     # is tested in isolation against a purpose-built app.
     RATE_LIMIT="100000/minute",
+    # No mail provider, whatever the developer has in .env. Settings reads
+    # that file too, so without these the suite would inherit real SMTP
+    # credentials — and the one test that exercises the real sender would
+    # try to deliver a sign-in code to an example.test address.
+    # Environment wins over .env, so empty here means empty everywhere.
+    SMTP_HOST="",
+    SMTP_USER="",
+    SMTP_PASSWORD="",
+    MAIL_FROM="",
 )
 
 

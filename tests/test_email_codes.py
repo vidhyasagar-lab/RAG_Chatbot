@@ -33,6 +33,25 @@ def sent(monkeypatch):
     return box
 
 
+def test_the_suite_cannot_reach_a_real_mail_provider():
+    """A guard, not a behaviour.
+
+    Settings reads .env as well as the environment, so a developer with
+    working SMTP credentials would otherwise have them pulled into the test
+    run — and the test that exercises the real sender would try to deliver a
+    sign-in code to an address in example.test. conftest pins these empty;
+    this fails loudly if that ever stops working.
+    """
+    from app.config import get_settings
+
+    settings = get_settings()
+    assert not settings.email_sending_configured, (
+        "the suite picked up real mail settings; conftest must pin SMTP_HOST "
+        "and MAIL_FROM empty before any app module is imported"
+    )
+    assert not settings.smtp_password, "a real SMTP credential reached the tests"
+
+
 # ── Addresses ────────────────────────────────────────────────────────
 
 def test_addresses_are_matched_case_insensitively():
