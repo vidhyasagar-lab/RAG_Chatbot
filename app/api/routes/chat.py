@@ -171,6 +171,10 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
     # draft glued to the answer that replaced it, so each attempt is kept apart
     # and `done` names the winner.
     answers: dict[int, str] = {}
+    # A greeting, or a question nothing was retrieved for, is answered without
+    # a model call. Charging one of the account's 25 answers for "hi" would be
+    # charging for something that cost nothing to produce.
+    chargeable = True
     # What each answer was built on, stored with it so a reopened chat can show
     # its sources and verdict. One verdict per attempt: a rejected draft's
     # scores must not be filed against the replacement.
@@ -223,12 +227,13 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
         # the reader actually received: a request that dies before producing
         # text costs nothing, and one they read in full is charged even if
         # they disconnect during the quality gate.
-        if not is_exempt(current_user):
+        if chargeable and not is_exempt(current_user):
             increment_exchanges(current_user["user_id"])
         if is_new:
             update_session_title(session_id, _auto_title(request.question))
 
     async def event_generator():
+        nonlocal chargeable
         try:
             async for chunk in ask_stream(**pipeline_args):
                 yield chunk
@@ -257,6 +262,8 @@ async def chat_stream(request: ChatRequest, current_user: dict = Depends(require
                         "attempt": attempt,
                     }
                 elif kind == "done":
+                    if payload.get("charged") is False:
+                        chargeable = False
                     _persist(payload.get("final_attempt", 1))
         except Exception:
             logger.exception("rag_stream_error")
