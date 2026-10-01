@@ -9,15 +9,13 @@ import uuid
 from itsdangerous import TimestampSigner, URLSafeTimedSerializer
 
 from app.config import get_settings
+from tests.helpers import sign_up
 
 HOUR = 60 * 60
 
 
 def _register(client) -> str:
-    resp = client.post(
-        "/api/v1/auth/register",
-        json={"username": f"idle_{uuid.uuid4().hex[:10]}@example.test", "password": "correct-horse-battery"},
-    )
+    resp = sign_up(client, f"idle_{uuid.uuid4().hex[:10]}@example.test", "correct-horse-battery")
     assert resp.status_code == 201, resp.text
     client.cookies.clear()
     return resp.json()["user_id"]
@@ -43,7 +41,7 @@ def _me(client, token: str):
 
 def test_login_cookie_lasts_the_idle_window_not_a_week(client):
     username = f"idle_{uuid.uuid4().hex[:10]}@example.test"
-    resp = client.post("/api/v1/auth/register", json={"username": username, "password": "correct-horse-battery"})
+    resp = sign_up(client, username, "correct-horse-battery")
     client.cookies.clear()
     (cookie,) = _session_cookies(resp)
     assert f"Max-Age={get_settings().session_idle_minutes * 60}" in cookie

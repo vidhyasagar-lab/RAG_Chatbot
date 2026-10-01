@@ -14,6 +14,7 @@ import pytest
 
 from app.core.chat_store import add_message, create_session, get_session_messages, revise_answer_message
 from app.core.eval_store import get_gate_result, save_gate_result
+from tests.helpers import sign_up
 
 # faithfulness is the rewrite's; draft_faithfulness the rejected draft's.
 RESULT = {"verdict": "rejected", "faithfulness": 0.86, "context_precision": 0.8,
@@ -109,8 +110,7 @@ def test_an_unknown_trace_changes_nothing():
 def signed_in(client):
     client.cookies.clear()
     name = f"gate_{uuid.uuid4().hex[:10]}@example.test"
-    resp = client.post("/api/v1/auth/register",
-                       json={"username": name, "password": "correct-horse-battery"})
+    resp = sign_up(client, name, "correct-horse-battery")
     assert resp.status_code == 201
     yield client, client.get("/api/v1/auth/me").json()["user_id"]
     client.cookies.clear()

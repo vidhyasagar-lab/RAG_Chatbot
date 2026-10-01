@@ -123,6 +123,23 @@ class AuthCredentials(BaseModel):
     password: str = Field(..., min_length=1, max_length=1024)
 
 
+class RegisterCredentials(AuthCredentials):
+    """Registration body: credentials plus proof of the address.
+
+    ``code`` is required, and that is the whole point. Registration used to
+    create an account from nothing but a body, and it is one of the few paths
+    that bypass the API key - so anyone who could reach the host could mint
+    accounts, each carrying a lifetime answer budget that costs real money to
+    serve. Signing in by code has always verified the address before creating
+    an account; this makes the password door do the same.
+
+    Required rather than optional: an optional field that callers may omit is
+    not a gate, and the old unverified request would have kept working.
+    """
+
+    code: str = Field(..., min_length=4, max_length=12)
+
+
 class EmailCodeRequest(BaseModel):
     """Ask for a sign-in code to be emailed."""
 

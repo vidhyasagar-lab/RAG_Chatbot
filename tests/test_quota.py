@@ -22,6 +22,7 @@ from fastapi import HTTPException
 
 from app.config import get_settings
 from app.core import quota
+from tests.helpers import sign_up
 
 
 # ── the policy, without the web layer ────────────────────────────────
@@ -136,10 +137,7 @@ def _sse(payload: dict) -> str:
 def _register(client) -> str:
     client.cookies.clear()
     username = f"q_{uuid.uuid4().hex[:10]}@example.test"
-    resp = client.post(
-        "/api/v1/auth/register",
-        json={"username": username, "password": "correct-horse-battery"},
-    )
+    resp = sign_up(client, username, "correct-horse-battery")
     assert resp.status_code == 201, resp.text
     return resp.json()["user_id"]
 

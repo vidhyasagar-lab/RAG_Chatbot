@@ -15,6 +15,7 @@ import json
 import uuid
 
 import pytest
+from tests.helpers import sign_up
 
 
 def _sse(payload: dict) -> str:
@@ -96,10 +97,7 @@ def signed_in(client, monkeypatch):
 
     monkeypatch.setattr(chat_routes, "ask_stream", fake_stream)
     client.cookies.clear()
-    resp = client.post(
-        "/api/v1/auth/register",
-        json={"username": f"gate_{uuid.uuid4().hex[:10]}@example.test", "password": "correct-horse-battery"},
-    )
+    resp = sign_up(client, f"gate_{uuid.uuid4().hex[:10]}@example.test", "correct-horse-battery")
     assert resp.status_code == 201
     yield client
     client.cookies.clear()

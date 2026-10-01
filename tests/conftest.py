@@ -103,15 +103,25 @@ def client(_stub_embeddings):
 
 
 @pytest.fixture
+def register(client):
+    """``register(username, password)`` -> the response, address verified."""
+    from tests.helpers import sign_up
+
+    def _register(username: str, password: str = "correct-horse-battery"):
+        return sign_up(client, username, password)
+
+    return _register
+
+
+@pytest.fixture
 def registered_user(client):
     """Register a fresh user and return (username, password)."""
     import uuid
 
+    from tests.helpers import sign_up
+
     username = f"user_{uuid.uuid4().hex[:10]}@example.test"
     password = "correct-horse-battery"
-    resp = client.post(
-        "/api/v1/auth/register",
-        json={"username": username, "password": password},
-    )
+    resp = sign_up(client, username, password)
     assert resp.status_code == 201, resp.text
     return username, password

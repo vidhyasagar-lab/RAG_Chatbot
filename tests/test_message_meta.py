@@ -11,6 +11,7 @@ import json
 import uuid
 
 import pytest
+from tests.helpers import sign_up
 
 SOURCES = [{"source": "uploads/u1/report.pdf", "page": 4, "chunk_index": 1, "content_type": "text"}]
 IMAGES = [{"path": "uploads/extracted/report_p4_chart.png", "page": 4, "source": "report.pdf", "content_type": "chart"}]
@@ -84,10 +85,7 @@ def plain_stream(question, chat_history=None, top_k=None, user_id="", session_id
 @pytest.fixture
 def signed_in(client):
     client.cookies.clear()
-    resp = client.post(
-        "/api/v1/auth/register",
-        json={"username": f"meta_{uuid.uuid4().hex[:10]}@example.test", "password": "correct-horse-battery"},
-    )
+    resp = sign_up(client, f"meta_{uuid.uuid4().hex[:10]}@example.test", "correct-horse-battery")
     assert resp.status_code == 201
     yield client
     client.cookies.clear()

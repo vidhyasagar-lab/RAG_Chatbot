@@ -47,6 +47,7 @@ from app.models.schemas import (
     AuthUserResponse,
     EmailCodeRequest,
     EmailCodeSent,
+    RegisterCredentials,
     EmailCodeVerify,
 )
 
@@ -102,18 +103,41 @@ async def login(credentials: AuthCredentials, response: Response) -> AuthUserRes
 
 
 @router.post("/register", response_model=AuthUserResponse, status_code=201)
-async def register(credentials: AuthCredentials, response: Response) -> AuthUserResponse:
-    """Create a user and issue a session cookie.
+async def register(credentials: RegisterCredentials, response: Response) -> AuthUserResponse:
+    """Create a user, once the address has been proved, and sign them in.
+
+    The code is redeemed first, so a refused registration writes nothing.
+    Without it this endpoint created an account from nothing but a request
+    body, and it bypasses the API key - so anyone able to reach the host
+    could mint accounts, each with a lifetime answer budget behind it.
 
     Validation (empty username, password length, name collision) lives in
     ``register_user`` and surfaces as ValueError; it is translated to 400 here
     rather than duplicated, so the rules cannot drift between call sites.
     """
+    email = normalise_email(credentials.username)
+
+    # The same lockout and attempt cap as the sign-in door, keyed by address:
+    # both redeem the same code, so registering must not be a way around the
+    # cap that protects signing in.
+    if not check_login_allowed(email):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts. Try again in 5 minutes.",
+            headers={"Retry-After": str(lockout_remaining(email))},
+        )
+    if not verify_code(email, credentials.code):
+        record_failed_login(email)
+        logger.warning("register_code_rejected", email=email)
+        raise HTTPException(status_code=401, detail="That code is wrong or has expired.")
+
     try:
-        user = register_user(credentials.username, credentials.password)
+        user = register_user(email, credentials.password)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
+    clear_failed_logins(email)
+    logger.info("user_registered_verified", email=email)
     set_session_cookie(response, user["user_id"])
     return _public_user(user)
 

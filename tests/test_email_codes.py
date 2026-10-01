@@ -13,6 +13,7 @@ import uuid
 import pytest
 
 from app.core import login_codes
+from tests.helpers import sign_up
 
 
 def _address() -> str:
@@ -381,9 +382,7 @@ def test_both_doors_open_the_same_account(client, sent, monkeypatch):
     email = _address()
     password = "correct-horse-battery"
 
-    registered = client.post(
-        "/api/v1/auth/register", json={"username": email, "password": password}
-    )
+    registered = sign_up(client, email, password)
     assert registered.status_code == 201, registered.text
     client.cookies.clear()
 

@@ -5,15 +5,14 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from tests.helpers import sign_up
 
 
 def test_register_then_login(client):
     username = f"user_{uuid.uuid4().hex[:10]}@example.test"
     password = "correct-horse-battery"
 
-    resp = client.post(
-        "/api/v1/auth/register", json={"username": username, "password": password}
-    )
+    resp = sign_up(client, username, password)
     assert resp.status_code == 201, resp.text
     assert resp.json()["username"] == username
     assert client.cookies.get("user_id"), "no session cookie set on register"
@@ -30,10 +29,7 @@ def test_register_then_login(client):
 
 def test_login_with_wrong_password_is_rejected(client):
     username = f"user_{uuid.uuid4().hex[:10]}@example.test"
-    client.post(
-        "/api/v1/auth/register",
-        json={"username": username, "password": "correct-horse-battery"},
-    )
+    sign_up(client, username, "correct-horse-battery")
     client.cookies.clear()
 
     resp = client.post(
@@ -51,10 +47,7 @@ def test_login_does_not_reveal_whether_a_username_exists(client):
     property is the whole reason login does not report "no such user".
     """
     known = f"user_{uuid.uuid4().hex[:10]}@example.test"
-    client.post(
-        "/api/v1/auth/register",
-        json={"username": known, "password": "correct-horse-battery"},
-    )
+    sign_up(client, known, "correct-horse-battery")
     client.cookies.clear()
 
     wrong_password = client.post(
@@ -87,10 +80,7 @@ def test_register_reports_the_real_password_minimum(client):
     to the contract: registration must reject a short password with a message
     naming the real limit, which is what any client now reads it from.
     """
-    resp = client.post(
-        "/api/v1/auth/register",
-        json={"username": f"user_{uuid.uuid4().hex[:10]}@example.test", "password": "1234567"},
-    )
+    resp = sign_up(client, f"user_{uuid.uuid4().hex[:10]}@example.test", "1234567")
     assert resp.status_code == 400, resp.text
     assert "at least 8 characters" in resp.json()["detail"]
 
@@ -124,7 +114,7 @@ def test_locked_out_login_returns_429_with_retry_after(client):
     when to retry instead of having to guess."""
     username = f"user_{uuid.uuid4().hex[:10]}@example.test"
     password = "correct-horse-battery"
-    client.post("/api/v1/auth/register", json={"username": username, "password": password})
+    sign_up(client, username, password)
     client.cookies.clear()
 
     for _ in range(5):
@@ -152,10 +142,7 @@ def test_session_cookie_is_signed_and_tamper_evident():
 
 def test_logout_clears_the_session_cookie(client):
     username = f"user_{uuid.uuid4().hex[:10]}@example.test"
-    client.post(
-        "/api/v1/auth/register",
-        json={"username": username, "password": "correct-horse-battery"},
-    )
+    sign_up(client, username, "correct-horse-battery")
     assert client.cookies.get("user_id")
 
     resp = client.post("/api/v1/auth/logout")

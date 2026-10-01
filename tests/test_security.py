@@ -7,6 +7,7 @@ fails loudly rather than silently.
 from __future__ import annotations
 
 import pytest
+from tests.helpers import sign_up
 
 
 # ── SEC-2: the passwordless login endpoint is gone ───────────────────────
@@ -170,10 +171,7 @@ def _login_fresh_user(client):
 
     username = f"user_{uuid.uuid4().hex[:10]}@example.test"
     client.cookies.clear()
-    resp = client.post(
-        "/api/v1/auth/register",
-        json={"username": username, "password": "correct-horse-battery"},
-    )
+    resp = sign_up(client, username, "correct-horse-battery")
     assert resp.status_code == 201, resp.text
     return resp.json()["user_id"]
 
