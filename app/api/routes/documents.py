@@ -34,6 +34,33 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 
 MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB
 
+#: How much of an upload is held at once while measuring it. The body used
+#: to be read in full with `await file.read()` and the length checked after,
+#: so the limit described what would be accepted rather than what would be
+#: held: a 2 GB body was buffered before being refused. On a 1 OCPU instance
+#: with a couple of gigabytes of RAM that is cheap memory pressure, and it
+#: needs nothing but a signed-in account.
+UPLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MB
+
+
+async def _read_capped(upload: UploadFile, limit: int) -> bytes:
+    """The upload's bytes, or raise 413 as soon as it passes ``limit``.
+
+    One chunk past the limit is enough to know, so a refusal costs a chunk
+    rather than the whole body.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(UPLOAD_CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(status_code=413, detail="File exceeds 50 MB limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
 # File signatures (magic bytes) for supported binary formats
 _MAGIC_SIGNATURES: dict[str, list[bytes]] = {
     ".pdf": [b"%PDF"],
@@ -81,10 +108,9 @@ async def upload_document(
             detail=f"Unsupported file type '{ext}'. Supported: {sorted(SUPPORTED_EXTENSIONS)}",
         )
 
-    # Read and validate size
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_SIZE:
-        raise HTTPException(status_code=413, detail="File exceeds 50 MB limit")
+    # Read in bounded chunks, refusing as soon as the limit is passed, so an
+    # oversized body is never held in full.
+    content = await _read_capped(file, MAX_UPLOAD_SIZE)
 
     # Validate magic bytes match the declared extension
     if not _validate_magic_bytes(content, ext):
