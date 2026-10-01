@@ -67,23 +67,69 @@ def _init_tables(conn: sqlite3.Connection) -> None:
 
 # ── User operations ──────────────────────────────────────────────────
 
+#: Rounds for new and re-hashed passwords. 600,000 is the current OWASP
+#: figure for PBKDF2-HMAC-SHA256; this was 260,000, set when it was.
+PBKDF2_ROUNDS = 600_000
+
+#: The round count stored by the old format, which recorded it nowhere.
+_LEGACY_ROUNDS = 260_000
+
+
+def _derive(password: str, salt: bytes, rounds: int) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations=rounds).hex()
+
+
 def _hash_password(password: str) -> str:
-    """Hash a password with PBKDF2-SHA256."""
+    """Hash a password with PBKDF2-SHA256.
+
+    The round count goes into the string. The old format was
+    ``salt_hex:dk_hex`` and recorded it nowhere, so raising it would have
+    invalidated every stored password at once; written down, it can be moved
+    again without a reset.
+    """
     salt = os.urandom(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations=260_000)
-    return salt.hex() + ":" + dk.hex()
+    return f"pbkdf2${PBKDF2_ROUNDS}${salt.hex()}${_derive(password, salt, PBKDF2_ROUNDS)}"
+
+
+#: Verified against when no account matched, so that an address with no
+#: account costs the same key derivation as one with. Login returns the same
+#: message for "no such user" and "wrong password" precisely so it cannot be
+#: used to find out who has an account; returning early for the first gave
+#: that away in the timing instead - tens of milliseconds, easily measured.
+#:
+#: A real hash of an unguessable value, so nothing verifies against it.
+_DUMMY_HASH = f"pbkdf2${PBKDF2_ROUNDS}${'00' * 16}${'00' * 32}"
 
 
 def _verify_password(password: str, password_hash: str) -> bool:
-    """Verify a password against its PBKDF2 hash."""
+    """Verify a password against its stored hash, in either format."""
     try:
-        salt_hex, dk_hex = password_hash.split(":", 1)
+        if password_hash.startswith("pbkdf2$"):
+            _, rounds_text, salt_hex, dk_hex = password_hash.split("$", 3)
+            rounds = int(rounds_text)
+        else:
+            # The old two-part format, at the count it was written with.
+            salt_hex, dk_hex = password_hash.split(":", 1)
+            rounds = _LEGACY_ROUNDS
         salt = bytes.fromhex(salt_hex)
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations=260_000)
         # Constant-time: a plain == leaks how far the comparison matched.
-        return hmac.compare_digest(dk.hex(), dk_hex)
+        return hmac.compare_digest(_derive(password, salt, rounds), dk_hex)
     except (ValueError, AttributeError):
         return False
+
+
+def _needs_rehash(password_hash: str) -> bool:
+    """True when a verified password should be stored again, stronger.
+
+    Done at sign-in rather than by asking everyone to reset: that is the one
+    moment the plaintext is in hand anyway.
+    """
+    if not password_hash.startswith("pbkdf2$"):
+        return True
+    try:
+        return int(password_hash.split("$", 3)[1]) < PBKDF2_ROUNDS
+    except (ValueError, IndexError):
+        return True
 
 
 def register_user(username: str, password: str) -> dict[str, Any]:
@@ -115,7 +161,16 @@ def register_user(username: str, password: str) -> dict[str, Any]:
 
 
 def authenticate_user(username: str, password: str) -> dict[str, Any] | None:
-    """Verify credentials. Returns user dict or None."""
+    """Verify credentials. Returns user dict or None.
+
+    Every path through here performs exactly one key derivation, including
+    the ones that cannot succeed. Login answers the same way for "no such
+    user" and "wrong password" so it cannot be asked who has an account, and
+    returning before the derivation gave that away in the timing instead:
+    an unknown address answered in under a millisecond where a real one
+    spent 600,000 rounds. An account with no password - the code door
+    creates those - would have said so the same way.
+    """
     conn = _get_conn()
     username = username.strip()
     row = conn.execute(
@@ -123,12 +178,29 @@ def authenticate_user(username: str, password: str) -> dict[str, Any] | None:
         "COALESCE(exchanges_used, 0) as exchanges_used FROM users WHERE username = ?",
         (username,),
     ).fetchone()
+
+    # A stand-in hash when there is no account, or the account has no
+    # password. _verify_password fails closed on both, having done the work.
+    stored = (row["password_hash"] if row else "") or _DUMMY_HASH
+    verified = _verify_password(password, stored)
+
     if not row:
         logger.warning("auth_user_not_found", username=username)
         return None
-    if not _verify_password(password, row["password_hash"]):
+    if not verified:
         logger.warning("auth_bad_password", username=username, user_id=row["user_id"])
         return None
+
+    # The plaintext is in hand and correct, which is the only moment a
+    # stronger hash can be written without asking anyone to reset anything.
+    if _needs_rehash(row["password_hash"]):
+        conn.execute(
+            "UPDATE users SET password_hash = ? WHERE user_id = ?",
+            (_hash_password(password), row["user_id"]),
+        )
+        conn.commit()
+        logger.info("password_hash_upgraded", user_id=row["user_id"], rounds=PBKDF2_ROUNDS)
+
     return {"user_id": row["user_id"], "username": row["username"], "created_at": row["created_at"], "role": row["role"] if "role" in row.keys() else "user"}
 
 
