@@ -58,15 +58,39 @@ EXPOSE 8000
 # without this is the same address for everyone behind the proxy, letting one
 # caller exhaust the login budget for all.
 #
-# The trust list is "*", not "127.0.0.1". Requests do NOT arrive from loopback:
-# the container is bridge-networked, so Docker's userland proxy forwards them
-# in and uvicorn sees the bridge gateway. Verified on the VM - every proxied
-# request logs 172.18.0.1, and only in-container healthchecks log 127.0.0.1.
-# A loopback-only list therefore never matches and the rewrite never happens.
+# The trust list is the private ranges, and it must not be "127.0.0.1" or
+# "*". Both of those have been wrong here, for opposite reasons.
 #
-# "*" is safe here because the trust boundary is the port binding, not this
-# list: docker-compose.yml publishes to 127.0.0.1:8000, so nothing off-host can
-# reach this process at all. Only Caddy can, and Caddy overwrites
-# X-Forwarded-For with the real peer. Widening this WOULD be unsafe if the
-# published port were ever moved back to 0.0.0.0.
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# Not loopback: requests do NOT arrive from 127.0.0.1. The container is
+# bridge-networked, so Docker's userland proxy forwards them in and uvicorn
+# sees the bridge gateway. Verified on the VM - every proxied request logs
+# 172.18.0.1, and only in-container healthchecks log 127.0.0.1. A
+# loopback-only list never matches, so the rewrite never happens and every
+# caller shares the gateway's rate-limit bucket.
+#
+# Not "*" either, which is what this said before. Trusting every host makes
+# uvicorn take the LEFTMOST X-Forwarded-For entry:
+#
+#     if self.always_trust:
+#         return _parse_host_port(x_forwarded_for_hosts[0])
+#
+# That was justified here by the claim that Caddy overwrites the header, so
+# there would only ever be one entry. The measured part was the gateway
+# address above; the overwrite was an assumption, and Caddy's documented
+# default is to APPEND the peer. If it appends, a caller who sends their own
+# X-Forwarded-For puts a value of their choosing to the left of the real one,
+# uvicorn believes it, and request.client.host - which the rate limiter keys
+# on - becomes theirs to pick. A fresh budget on every request.
+#
+# A real list makes uvicorn walk the header from the right and return the
+# first untrusted hop, which is correct whether Caddy appends or overwrites,
+# and stops depending on which. The whole private range rather than
+# 172.18.0.1 alone because Compose chooses that subnet itself and naming one
+# would break the same silent way a loopback list does. A public client
+# address is never private, so nothing real is skipped.
+#
+# The port binding in docker-compose.yml is still the outer boundary, but it
+# is no longer the only thing standing between a caller and the limiter.
+# Keep this in step with TRUSTED_PROXY_IPS in app/api/rate_limit.py;
+# tests/test_rate_limit_proxy.py fails if they drift.
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"]

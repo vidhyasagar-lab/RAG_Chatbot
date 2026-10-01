@@ -49,24 +49,54 @@ def _from_trusted_proxy(request) -> bool:
     return hmac.compare_digest(provided.encode(), key.encode())
 
 
+#: What ``--forwarded-allow-ips`` must be set to, and why the peer address
+#: below can be believed at all.
+#:
+#: uvicorn runs with ``--proxy-headers``, so it rewrites ``scope["client"]``
+#: from ``X-Forwarded-For`` - and *which* entry it takes depends entirely on
+#: this list. Trusting every host (``"*"``) made it take the **leftmost**::
+#:
+#:     if self.always_trust:
+#:         return _parse_host_port(x_forwarded_for_hosts[0])
+#:
+#: Caddy appends the true client address, so a caller who sent their own
+#: ``X-Forwarded-For`` placed a value of their choosing to the left of it and
+#: ``request.client.host`` became theirs to pick - a fresh rate-limit bucket
+#: on every request. With a real list uvicorn instead walks the header from
+#: the right and returns the first *untrusted* hop, which is the address
+#: Caddy appended.
+#:
+#: The whole private range rather than one gateway address: the app reaches
+#: this host through Docker's bridge, and Compose picks that subnet itself
+#: (172.17.0.1, 172.18.0.1, ...). Naming one would break silently - uvicorn
+#: would stop rewriting, every user would land in the gateway's bucket, and
+#: one person's traffic would throttle everyone. A public client address is
+#: never private, so nothing real is skipped.
+#:
+#: ``tests/test_rate_limit_proxy.py`` pins the Dockerfile to this value.
+TRUSTED_PROXY_IPS = "127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+
+
 def _client_key(request) -> str:
     """Bucket key for a request.
 
-    Normally the *direct* peer address. ``X-Forwarded-For`` is client
-    controlled and trivially spoofed, so honouring it would let anyone reset
-    their own budget.
+    The *direct* peer address, which uvicorn has resolved to the real client
+    using ``TRUSTED_PROXY_IPS``. ``X-Forwarded-For`` is deliberately not read
+    here: the app cannot tell whether it arrived through the reverse proxy or
+    straight from a caller who made it up, and trusting it unconditionally
+    hands every caller a fresh budget whenever the port is reachable.
 
-    The one exception is ``X-Client-IP`` on a request that also carries a valid
-    API key: that request came from the frontend proxy, where every user shares
-    the proxy's egress address. Anything that is not a valid IP falls back to
-    the peer, so the header cannot mint arbitrary buckets.
+    The one exception is ``X-Client-IP`` on a request that also carries a
+    valid API key. Only the frontend's server-side proxy holds the key, and
+    behind it every user shares one egress address, so without this they
+    would all share one bucket.
     """
     client = request.client
     peer = client.host if client and client.host else "unknown"
-    forwarded = request.headers.get("X-Client-IP")
-    if forwarded and _from_trusted_proxy(request):
+    named = request.headers.get("X-Client-IP")
+    if named and _from_trusted_proxy(request):
         try:
-            return str(ipaddress.ip_address(forwarded.strip()))
+            return str(ipaddress.ip_address(named.strip()))
         except ValueError:
             logger.warning("rate_limit_bad_client_ip", peer=peer)
     return peer
