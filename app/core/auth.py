@@ -185,47 +185,71 @@ def require_admin_user(user_id: str = Cookie(None)) -> dict[str, Any]:
 
 _MAX_ATTEMPTS = 5
 _LOCKOUT_SECONDS = 300  # 5 minutes
-_attempts: dict[str, list[float]] = {}  # username → list of timestamps
-_lockouts: dict[str, float] = {}        # username → lockout-until timestamp
+_attempts: dict[str, list[float]] = {}  # scoped key → list of timestamps
+_lockouts: dict[str, float] = {}        # scoped key → lockout-until timestamp
 _bf_lock = Lock()
 
+#: The doors, counted separately.
+#:
+#: Both are reached by address, so a single counter had them sharing one: five
+#: wrong password guesses also locked the person out of signing in by emailed
+#: code - the door they would reach for precisely because they could not
+#: remember the password. It also let anyone who knows an address close both
+#: doors on demand.
+#:
+#: Deliberately not keyed per client address as well. That would fix the
+#: nuisance and break the defence: a distributed attacker would get five
+#: guesses per address they came from instead of five in total, which is the
+#: attack this exists to stop. A five-minute wait with the other door open is
+#: the better trade.
+PASSWORD_SCOPE = "password"
+CODE_SCOPE = "code"
 
-def check_login_allowed(username: str) -> bool:
-    """Return True if login attempts are allowed for this username."""
+
+def _scoped(identity: str, scope: str) -> str:
+    return f"{scope}:{identity}"
+
+
+def check_login_allowed(username: str, scope: str = PASSWORD_SCOPE) -> bool:
+    """Return True if attempts are allowed for this identity on this door."""
+    key = _scoped(username, scope)
     now = time.time()
     with _bf_lock:
-        lockout_until = _lockouts.get(username, 0)
+        lockout_until = _lockouts.get(key, 0)
         if now < lockout_until:
             return False
         # Clean expired lockout
-        if username in _lockouts and now >= lockout_until:
-            del _lockouts[username]
+        if key in _lockouts and now >= lockout_until:
+            del _lockouts[key]
     return True
 
 
-def record_failed_login(username: str) -> None:
-    """Record a failed login attempt. Triggers lockout after MAX_ATTEMPTS."""
+def record_failed_login(username: str, scope: str = PASSWORD_SCOPE) -> None:
+    """Record a failed attempt. Triggers lockout after MAX_ATTEMPTS."""
+    key = _scoped(username, scope)
     now = time.time()
     with _bf_lock:
-        timestamps = _attempts.setdefault(username, [])
+        timestamps = _attempts.setdefault(key, [])
         # Keep only recent attempts within the lockout window
         timestamps[:] = [t for t in timestamps if now - t < _LOCKOUT_SECONDS]
         timestamps.append(now)
         if len(timestamps) >= _MAX_ATTEMPTS:
-            _lockouts[username] = now + _LOCKOUT_SECONDS
-            _attempts[username] = []
-            logger.warning("account_locked", username=username, lockout_seconds=_LOCKOUT_SECONDS)
+            _lockouts[key] = now + _LOCKOUT_SECONDS
+            _attempts[key] = []
+            logger.warning("account_locked", username=username, scope=scope,
+                           lockout_seconds=_LOCKOUT_SECONDS)
 
 
-def clear_failed_logins(username: str) -> None:
-    """Clear failed login records on successful authentication."""
+def clear_failed_logins(username: str, scope: str = PASSWORD_SCOPE) -> None:
+    """Clear failed attempt records for one door on successful use of it."""
+    key = _scoped(username, scope)
     with _bf_lock:
-        _attempts.pop(username, None)
-        _lockouts.pop(username, None)
+        _attempts.pop(key, None)
+        _lockouts.pop(key, None)
 
 
-def lockout_remaining(username: str) -> int:
-    """Seconds until a locked-out username may try again (at least 1)."""
+def lockout_remaining(username: str, scope: str = PASSWORD_SCOPE) -> int:
+    """Seconds until this identity may try this door again (at least 1)."""
     with _bf_lock:
-        until = _lockouts.get(username, 0)
+        until = _lockouts.get(_scoped(username, scope), 0)
     return max(1, int(until - time.time()))

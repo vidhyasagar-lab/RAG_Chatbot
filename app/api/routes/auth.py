@@ -17,6 +17,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Response
 
 from app.core.auth import (
+    CODE_SCOPE,
     check_login_allowed,
     clear_failed_logins,
     clear_session_cookie,
@@ -122,14 +123,14 @@ async def register(credentials: RegisterCredentials, response: Response) -> Auth
     # The same lockout and attempt cap as the sign-in door, keyed by address:
     # both redeem the same code, so registering must not be a way around the
     # cap that protects signing in.
-    if not check_login_allowed(email):
+    if not check_login_allowed(email, scope=CODE_SCOPE):
         raise HTTPException(
             status_code=429,
             detail="Too many failed attempts. Try again in 5 minutes.",
-            headers={"Retry-After": str(lockout_remaining(email))},
+            headers={"Retry-After": str(lockout_remaining(email, scope=CODE_SCOPE))},
         )
     if not verify_code(email, credentials.code):
-        record_failed_login(email)
+        record_failed_login(email, scope=CODE_SCOPE)
         logger.warning("register_code_rejected", email=email)
         raise HTTPException(status_code=401, detail="That code is wrong or has expired.")
 
@@ -138,7 +139,7 @@ async def register(credentials: RegisterCredentials, response: Response) -> Auth
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
-    clear_failed_logins(email)
+    clear_failed_logins(email, scope=CODE_SCOPE)
     logger.info("user_registered_verified", email=email)
     set_session_cookie(response, user["user_id"])
     return _public_user(user)
@@ -206,21 +207,24 @@ async def verify_code_and_sign_in(body: EmailCodeVerify, response: Response) -> 
     """
     email = normalise_email(body.email)
 
-    # The same lockout that guards passwords, keyed by address. The attempt
-    # cap inside the code store kills one code; this stops someone burning
-    # through a fresh code every cooldown to keep guessing.
-    if not check_login_allowed(email):
+    # The same kind of lockout that guards passwords, but counted on its own
+    # door: sharing one counter meant wrong password guesses closed this one
+    # too, which is the door someone reaches for when the password is the
+    # thing they cannot remember. The attempt cap inside the code store kills
+    # one code; this stops someone burning a fresh code every cooldown to
+    # keep guessing.
+    if not check_login_allowed(email, scope=CODE_SCOPE):
         raise HTTPException(
             status_code=429,
             detail="Too many failed attempts. Try again in 5 minutes.",
-            headers={"Retry-After": str(lockout_remaining(email))},
+            headers={"Retry-After": str(lockout_remaining(email, scope=CODE_SCOPE))},
         )
 
     if not verify_code(email, body.code):
-        record_failed_login(email)
+        record_failed_login(email, scope=CODE_SCOPE)
         raise HTTPException(status_code=401, detail="That code is wrong or has expired.")
 
-    clear_failed_logins(email)
+    clear_failed_logins(email, scope=CODE_SCOPE)
     user, created = get_or_create_user_by_email(email)
     logger.info("signed_in_with_code", user_id=user["user_id"], created=created)
     set_session_cookie(response, user["user_id"])
