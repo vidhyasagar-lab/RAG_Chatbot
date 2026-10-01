@@ -14,12 +14,13 @@ endpoint does not become a username oracle.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Response
 
 from app.core.auth import (
     check_login_allowed,
     clear_failed_logins,
     clear_session_cookie,
+    get_current_user_id,
     lockout_remaining,
     record_failed_login,
     require_authenticated_user,
@@ -41,6 +42,7 @@ from app.core.user_store import (
     get_or_create_user_by_email,
     get_user_documents,
     register_user,
+    revoke_sessions,
 )
 from app.models.schemas import (
     AuthCredentials,
@@ -228,13 +230,25 @@ async def verify_code_and_sign_in(body: EmailCodeVerify, response: Response) -> 
 
 
 @router.post("/logout", status_code=204)
-async def logout(response: Response) -> Response:
-    """Clear the session cookie.
+async def logout(response: Response, user_id: str = Cookie(None)) -> Response:
+    """End the session: retire the cookie, then clear it.
+
+    Clearing alone only made the browser forget the value. Anything that had
+    already captured it - a shared machine, a proxy log, a backup - kept
+    working until the idle window lapsed, because the cookie was a bearer
+    token with nothing able to retire it. Bumping the account's session
+    generation invalidates every cookie issued before this moment.
+
+    Still answers 204 when there is no valid session: signing out of nothing
+    is not an error, and saying so would report whether a cookie was good.
 
     POST rather than GET: the form-based version was a GET, which meant any
     page could log a user out with an <img> tag. Nothing renders HTML here
     any more, so the safer verb costs nothing.
     """
+    uid = get_current_user_id(user_id)
+    if uid:
+        revoke_sessions(uid)
     clear_session_cookie(response)
     response.status_code = 204
     return response

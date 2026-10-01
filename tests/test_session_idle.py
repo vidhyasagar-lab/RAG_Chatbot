@@ -22,13 +22,20 @@ def _register(client) -> str:
 
 
 def _token(user_id: str, age_seconds: int) -> str:
-    """A session token as if it had been signed ``age_seconds`` ago."""
+    """A session token as if it had been signed ``age_seconds`` ago.
+
+    The payload is [user_id, generation], the same shape sign_user_id
+    produces - a bare id is refused now, since it cannot be shown to belong
+    to the current generation (tests/test_session_revocation.py).
+    """
+    from app.core.user_store import token_version
 
     class Past(TimestampSigner):
         def get_timestamp(self) -> int:
             return int(time.time()) - age_seconds
 
-    return URLSafeTimedSerializer(get_settings().secret_key, salt="session-cookie", signer=Past).dumps(user_id)
+    payload = [user_id, token_version(user_id) or 0]
+    return URLSafeTimedSerializer(get_settings().secret_key, salt="session-cookie", signer=Past).dumps(payload)
 
 
 def _session_cookies(resp) -> list[str]:

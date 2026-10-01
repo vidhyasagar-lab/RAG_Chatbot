@@ -11,7 +11,7 @@ from itsdangerous import BadSignature, URLSafeTimedSerializer
 
 from app.config import get_settings
 from app.core.logging import get_logger
-from app.core.user_store import get_user
+from app.core.user_store import get_user, token_version
 
 logger = get_logger(__name__)
 
@@ -34,18 +34,21 @@ def _get_signer() -> URLSafeTimedSerializer:
 
 
 def sign_user_id(user_id: str) -> str:
-    """Return an HMAC-signed token for the given user_id."""
-    return _get_signer().dumps(user_id)
+    """Return an HMAC-signed token naming the user and their session generation.
 
-
-def unsign_user_id(token: str, max_age: int | None = None) -> str | None:
-    """Verify and decode a signed token. Returns user_id or None.
-
-    ``max_age`` defaults to the idle timeout: the token's timestamp is when it
-    was last re-signed, so this rejects a session idle for longer than that.
+    The generation is what makes a cookie revocable. Signing the id alone
+    made it a bearer token nothing could retire: signing out cleared the
+    browser's copy and any captured copy kept working until the idle window
+    lapsed.
     """
+    return _get_signer().dumps([user_id, token_version(user_id) or 0])
+
+
+def _read_token(token: str, max_age: int | None) -> tuple[str, int] | None:
+    """The (user_id, generation) a token carries, if the signature holds."""
     try:
-        return _get_signer().loads(token, max_age=idle_seconds() if max_age is None else max_age)
+        payload = _get_signer().loads(
+            token, max_age=idle_seconds() if max_age is None else max_age)
     except BadSignature:
         # Tampered, forged, or expired — the ordinary rejection path.
         return None
@@ -54,6 +57,38 @@ def unsign_user_id(token: str, max_age: int | None = None) -> str | None:
         # in", but log it: unlike BadSignature this is not expected traffic.
         logger.exception("session_token_unreadable")
         return None
+
+    # The old payload was a bare user id with no generation to check against.
+    # Such a token cannot be shown to be current, so it is refused: everyone
+    # signs in once more after this ships, which is the cost of being able to
+    # revoke at all.
+    if not isinstance(payload, list) or len(payload) != 2:
+        logger.info("session_token_unversioned")
+        return None
+    user_id, version = payload
+    if not isinstance(user_id, str) or not isinstance(version, int):
+        return None
+    return user_id, version
+
+
+def unsign_user_id(token: str, max_age: int | None = None) -> str | None:
+    """Verify a signed token and return its user_id, or None.
+
+    ``max_age`` defaults to the idle timeout: the token's timestamp is when it
+    was last re-signed, so this rejects a session idle for longer than that.
+
+    The generation is checked against the account on every call, which is one
+    small indexed read. A token naming a generation that is no longer current
+    was issued before a sign-out or a password change and is refused.
+    """
+    read = _read_token(token, max_age)
+    if not read:
+        return None
+    user_id, version = read
+    if token_version(user_id) != version:
+        logger.info("session_token_revoked", user_id=user_id)
+        return None
+    return user_id
 
 
 def set_session_cookie(response: Response, user_id: str) -> None:
@@ -77,13 +112,20 @@ def refreshed_session_cookie(token: str) -> str | None:
     signed under a minute ago (nothing worth extending yet).
     """
     try:
-        user_id, signed_at = _get_signer().loads(token, max_age=idle_seconds(), return_timestamp=True)
+        payload, signed_at = _get_signer().loads(
+            token, max_age=idle_seconds(), return_timestamp=True)
     except BadSignature:
         return None
     except Exception:
         logger.exception("session_token_unreadable")
         return None
     if time.time() - signed_at.timestamp() < _REFRESH_AFTER_SECONDS:
+        return None
+    # Unversioned, or from a retired generation: nothing to extend.
+    if not isinstance(payload, list) or len(payload) != 2:
+        return None
+    user_id, version = payload
+    if token_version(user_id) != version:
         return None
     response = Response()
     set_session_cookie(response, user_id)

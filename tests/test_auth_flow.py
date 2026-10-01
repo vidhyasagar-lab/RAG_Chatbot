@@ -128,14 +128,28 @@ def test_locked_out_login_returns_429_with_retry_after(client):
 
 # ── Session cookie signing ───────────────────────────────────────────────
 
-def test_session_cookie_is_signed_and_tamper_evident():
+def test_session_cookie_is_signed_and_tamper_evident(client):
     from app.core.auth import sign_user_id, unsign_user_id
+    from app.core.user_store import admin_create_user
 
-    token = sign_user_id("user-123")
-    assert token != "user-123", "cookie value is not signed"
-    assert unsign_user_id(token) == "user-123"
+    # A real account: the token now names a session generation and is
+    # checked against the account that owns it, so one naming nobody cannot
+    # be shown to be current (tests/test_session_revocation.py).
+    user = admin_create_user(
+        f"signed_{uuid.uuid4().hex[:8]}@example.test", "correct-horse-battery")
+    uid = user["user_id"]
+
+    token = sign_user_id(uid)
+    assert token != uid, "cookie value is not signed"
+    assert unsign_user_id(token) == uid
     assert unsign_user_id(token[:-3] + "xyz") is None, "tampered token accepted"
     assert unsign_user_id("garbage") is None
+
+
+def test_a_token_naming_no_account_is_refused():
+    from app.core.auth import sign_user_id, unsign_user_id
+
+    assert unsign_user_id(sign_user_id("no-such-user")) is None
 
 
 # ── HYG-4: logout clears with matching attributes ────────────────────────

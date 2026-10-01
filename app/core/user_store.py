@@ -63,6 +63,14 @@ def _init_tables(conn: sqlite3.Connection) -> None:
     if "exchanges_used" not in cols:
         conn.execute("ALTER TABLE users ADD COLUMN exchanges_used INTEGER NOT NULL DEFAULT 0")
         conn.commit()
+    # Travels inside the signed session cookie and is checked on every
+    # request, so raising it retires every cookie issued before. Without it
+    # the cookie was a bearer token nothing could retire: logging out cleared
+    # the browser's copy and left any captured copy working until the idle
+    # window lapsed.
+    if "token_version" not in cols:
+        conn.execute("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
 
 
 # ── User operations ──────────────────────────────────────────────────
@@ -272,17 +280,53 @@ def has_password(user_id: str) -> bool:
 
 
 def set_password(user_id: str, password: str) -> None:
-    """Set or replace an account's password. Raises ValueError if too short."""
+    """Set or replace an account's password. Raises ValueError if too short.
+
+    Retires existing sessions. Changing a password is how someone responds
+    to it being known, so it has to end the sessions that knowledge may
+    already have opened.
+    """
     if not password or len(password) < 8:
         raise ValueError("Password must be at least 8 characters")
     conn = _get_conn()
     with _lock:
         conn.execute(
-            "UPDATE users SET password_hash = ? WHERE user_id = ?",
+            "UPDATE users SET password_hash = ?, token_version = token_version + 1 "
+            "WHERE user_id = ?",
             (_hash_password(password), user_id),
         )
         conn.commit()
     logger.info("password_set", user_id=user_id)
+
+
+def token_version(user_id: str) -> int | None:
+    """The account's current session generation, or None if it is gone.
+
+    None and 0 are different answers: 0 is a live account that has never
+    revoked anything, None is no account at all.
+    """
+    row = _get_conn().execute(
+        "SELECT COALESCE(token_version, 0) AS v FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    return int(row["v"]) if row else None
+
+
+def revoke_sessions(user_id: str) -> int:
+    """Retire every session cookie issued for this account so far.
+
+    Returns the new version. Used by sign-out, so that a cookie captured
+    beforehand stops working rather than merely being forgotten by the
+    browser that held it.
+    """
+    conn = _get_conn()
+    with _lock:
+        conn.execute(
+            "UPDATE users SET token_version = COALESCE(token_version, 0) + 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.commit()
+    logger.info("sessions_revoked", user_id=user_id)
+    return token_version(user_id) or 0
 
 
 def increment_exchanges(user_id: str) -> int:
