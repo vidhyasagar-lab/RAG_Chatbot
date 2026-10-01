@@ -1,25 +1,43 @@
-"""Spend and token totals from Langfuse's metrics API.
+"""Spend, tokens and traces for the admin usage page.
 
-Three facts about that API shape everything here, each of them learned the
-hard way against the live service:
+Everything comes from one endpoint, ``/api/public/v2/observations``, because
+the two this used to read are the two Langfuse rate-limits hardest, and it
+told us so itself in a 429: *"Rate limit exceeded for GET /api/public/traces.
+Use GET /api/public/v2/observations?fromStartTime=<from>&toStartTime=<to>
+for high-volume reads."*
 
-* **Tokens are not on a trace.** A trace object in SDK 4.x has no ``usage``
-  attribute at all, which is why the usage page reported 0 tokens for every
-  answer while costs were correct. Tokens live on the generations beneath a
-  trace, so every count here comes from the ``observations`` view.
-* **``userId`` is high cardinality.** Grouping by it is refused outright
-  unless the query also carries ``config.row_limit`` and an ``orderBy`` on a
-  measure, descending.
-* **Counts come back as strings.** ``sum_totalTokens`` is ``"25194"``, not
-  ``25194``. Adding those together concatenates them.
+Measured against the live service:
 
-Langfuse only records the opaque user id, so rows are joined against the
-account table: an admin needs to see an address, not a hex string.
+* ``/api/public/traces`` allows **5 requests a minute**. The page made three
+  of them on every load - one for the table, one for the per-user panel, one
+  for the summary's count - so it could not be opened twice in a minute, and
+  the per-user walk could fire ten in a single request.
+* the metrics API allows **100 requests a day**, which capped the page at
+  roughly thirty loads before every figure read "unavailable" until the
+  following morning.
+* the observations endpoint serves 1000 rows a call, pages by cursor, and
+  carries the lot.
+
+Two facts about its rows shape everything below, and neither is documented:
+
+* ``user_id`` is set **only on the root span**. The generations beneath it
+  have none, which is why grouping observations by ``userId`` in the metrics
+  API returned a single bucket with the whole bill in it.
+* ``total_cost`` and ``usage_details`` are set **only on the generations**.
+  The root span carries no money at all.
+
+So neither row type can answer on its own, and the endpoint's ``user_id``
+filter is no shortcut either: it matches per observation, so asking for one
+user returns their roots without the children, reporting no spend. Two
+reads, joined locally on ``trace_id``, is the only shape that works.
+
+One more trap: ``fields`` defaults to ``core,basic``, and a read without the
+``usage`` and ``metrics`` groups comes back with ``total_cost=None`` on every
+row - correct-looking, and entirely empty.
 """
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -28,13 +46,29 @@ from app.core.user_store import list_all_users
 
 logger = get_logger(__name__)
 
-#: Measure names as the metrics API spells them.
-_TOKENS = "totalTokens"
-_COST = "totalCost"
-
-#: What a row with no userId is called. Document ingestion and evaluation
-#: runs produce these, and their spend is real.
+#: What a row with no user is called. Document ingestion and evaluation runs
+#: produce these, and the vision preprocessing they do is real money.
 UNATTRIBUTED = "Not tied to a user"
+
+#: Field groups to ask for. Without ``usage`` and ``metrics`` the cost and
+#: token figures are null on every row; the default is ``core,basic``.
+OBSERVATION_FIELDS = "core,basic,io,usage,metrics,time,trace_context"
+
+#: Rows per call. 1000 is the documented maximum, and asking for all of it
+#: is what keeps a page load down to two requests.
+OBSERVATION_PAGE_SIZE = 1000
+
+#: How many pages of each row type one snapshot will walk. Three is enough
+#: for 3,000 observations of each kind; beyond that the snapshot says it
+#: truncated rather than quietly reporting part of the bill as the whole.
+MAX_OBSERVATION_PAGES = 3
+
+#: Sent with every call. The SDK retries with backoff by default, which is
+#: wrong for both limits here: the trace endpoint answers 429 with a
+#: retry-after of a minute and the metrics API with nearly a day, so the
+#: retry only held a worker thread - 122 seconds, measured - before failing
+#: anyway and leaving the page blank.
+REQUEST_OPTIONS: dict[str, Any] = {"max_retries": 0, "timeout_in_seconds": 30}
 
 
 class UsageUnavailable(RuntimeError):
@@ -44,50 +78,21 @@ class UsageUnavailable(RuntimeError):
 def _window(days: int) -> tuple[datetime, datetime]:
     """The reporting window, as timezone-aware datetimes.
 
-    Two APIs, two spellings, and sending the wrong one fails only against
-    the live service: the trace client reads ``.tzinfo`` off what it is
-    given, so an ISO string raises "'str' object has no attribute 'tzinfo'",
-    while the metrics endpoint takes JSON and therefore wants the string.
-    ``_iso`` converts at the one place that needs it.
+    Datetimes, not ISO strings: the client reads ``.tzinfo`` off what it is
+    given, and a string fails with "'str' object has no attribute 'tzinfo'".
     """
     now = datetime.now(timezone.utc)
     return now - timedelta(days=max(1, days)), now
 
 
-def _iso(window: tuple[datetime, datetime]) -> tuple[str, str]:
-    """The same window, spelled the way the metrics API wants it."""
-    return window[0].isoformat(), window[1].isoformat()
-
-
-#: Sent with every call, because the SDK's own default is to retry with
-#: backoff and that is the wrong behaviour here. Langfuse allows 100 API
-#: requests a day and answers 429 with a ``retry-after`` of the better part
-#: of a day, so a retry cannot possibly succeed - it just sat on the
-#: connection for 122 seconds, holding a worker thread, before giving up and
-#: leaving the page blank anyway. Failing immediately lets the table render
-#: with the token column unknown, which is the honest answer.
-REQUEST_OPTIONS: dict[str, Any] = {"max_retries": 0, "timeout_in_seconds": 20}
-
-
-def _run(lf: Any, query: dict) -> list[dict[str, Any]]:
-    """Send one metrics query. Raises UsageUnavailable on any failure."""
-    try:
-        response = lf.api.metrics.metrics(
-            query=json.dumps(query), request_options=REQUEST_OPTIONS)
-    except Exception as e:  # noqa: BLE001 - the SDK raises its own hierarchy
-        logger.exception("langfuse_metrics_failed", view=query.get("view"))
-        raise UsageUnavailable(str(e)) from e
-    return list(getattr(response, "data", None) or [])
-
-
 def _as_int(value: Any) -> int:
-    """Coerce "25194", 25194, 25194.0 or None to an int."""
+    """Coerce "2420", 2420, 2420.0 or None to an int."""
     if value is None or value == "":
         return 0
     try:
         return int(float(value))
     except (TypeError, ValueError):
-        logger.warning("langfuse_metric_not_a_number", value=repr(value))
+        logger.warning("usage_value_not_a_number", value=repr(value))
         return 0
 
 
@@ -97,161 +102,133 @@ def _as_float(value: Any) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
-        logger.warning("langfuse_metric_not_a_number", value=repr(value))
+        logger.warning("usage_value_not_a_number", value=repr(value))
         return 0.0
 
 
-#: The most Langfuse will accept for ``config.row_limit``. Above this the
-#: query is refused as "Invalid request data" - measured, not documented:
-#: 1000 is served, 5000 is rejected. Because the token query fails soft, a
-#: limit set too high shows up only as every user reporting zero tokens
-#: beside a correct cost, which is a maddening thing to debug.
-MAX_ROW_LIMIT = 1000
+def _walk(lf: Any, days: int, **filters: Any) -> tuple[list[Any], bool]:
+    """Read observations matching ``filters``, following the cursor.
 
-#: How many pages of traces one call will walk, at 100 per page. Capped to
-#: match MAX_ROW_LIMIT: reading more traces than the token query can cover
-#: would leave a tail of rows whose tokens read 0 for no visible reason.
-MAX_TRACE_PAGES = 10
-_TRACE_PAGE_SIZE = 100
-
-
-def _traces_in_window(lf: Any, days: int) -> list[Any]:
-    """Every trace in the window, up to the page cap."""
-    # Datetimes, not strings: the trace client reads .tzinfo off these.
+    Returns the rows and whether the walk stopped at the page cap with more
+    left behind. Raises UsageUnavailable rather than returning an empty list:
+    "nobody has spent anything" and "we were rate-limited" are different
+    answers, and drawing the second as the first is how the page spent a day
+    claiming every user had cost nothing.
+    """
     frm, to = _window(days)
-    collected: list[Any] = []
-    for page in range(1, MAX_TRACE_PAGES + 1):
+    rows: list[Any] = []
+    cursor: str | None = None
+    for _ in range(MAX_OBSERVATION_PAGES):
         try:
-            result = lf.api.trace.list(
-                page=page, limit=_TRACE_PAGE_SIZE,
-                from_timestamp=frm, to_timestamp=to,
+            result = lf.api.observations.get_many(
+                limit=OBSERVATION_PAGE_SIZE,
+                cursor=cursor,
+                fields=OBSERVATION_FIELDS,
+                from_start_time=frm,
+                to_start_time=to,
                 request_options=REQUEST_OPTIONS,
+                **filters,
             )
-        except Exception as e:  # noqa: BLE001
-            logger.exception("langfuse_trace_page_failed", page=page)
+        except Exception as e:  # noqa: BLE001 - the SDK raises its own hierarchy
+            logger.exception("observations_read_failed", filters=sorted(filters))
             raise UsageUnavailable(str(e)) from e
-        data = list(getattr(result, "data", None) or [])
-        collected.extend(data)
-        total_pages = getattr(getattr(result, "meta", None), "total_pages", 1) or 1
-        if page >= total_pages or len(data) < _TRACE_PAGE_SIZE:
-            break
-    return collected
+
+        rows.extend(list(getattr(result, "data", None) or []))
+        cursor = getattr(getattr(result, "meta", None), "cursor", None)
+        if not cursor:
+            # No cursor means no more rows: the walk finished.
+            return rows, False
+
+    logger.warning("observations_walk_truncated", filters=sorted(filters), rows=len(rows))
+    return rows, True
 
 
-def _grouped_token_rows(lf: Any, days: int) -> list[dict[str, Any]]:
-    """One row per trace in the window, with its token total.
+def _tokens_of(observation: Any) -> int:
+    """The total token count on a generation.
 
-    A single query, and the only one anything here needs to attribute tokens.
-    Langfuse allows 100 API requests a day, so a query per trace is not an
-    option: one page of twenty rows fetched individually spends a fifth of
-    the daily quota, and once it is gone every figure on the page reads
-    "unavailable" until the limit resets the next morning.
+    ``usage_details`` is ``{}`` on spans and can be absent altogether on a
+    generation that failed, so neither shape may raise.
     """
-    frm, to = _iso(_window(days))
-    return _run(lf, {
-        "view": "observations",
-        "dimensions": [{"field": "traceId"}],
-        "metrics": [{"measure": _TOKENS, "aggregation": "sum"}],
-        # traceId is high cardinality: both of these or Langfuse refuses.
-        "orderBy": [{"field": f"sum_{_TOKENS}", "direction": "desc"}],
-        "config": {"row_limit": MAX_ROW_LIMIT},
-        "fromTimestamp": frm,
-        "toTimestamp": to,
-    })
+    usage = getattr(observation, "usage_details", None) or {}
+    if not isinstance(usage, dict):
+        return 0
+    return _as_int(usage.get("total"))
 
 
-def _counts_from(rows: list[dict[str, Any]]) -> dict[str, int]:
-    return {
-        str(r.get("traceId") or ""): _as_int(r.get(f"sum_{_TOKENS}"))
-        for r in rows
-        if r.get("traceId")
-    }
+def usage_snapshot(lf: Any, days: int = 30, user_limit: int = 200) -> dict[str, Any]:
+    """Everything the usage page shows, from two reads of one endpoint.
 
-
-def _tokens_by_trace(lf: Any, days: int) -> dict[str, int]:
-    """Tokens for each trace, keyed by trace id.
-
-    Best effort. Cost is the number an admin is actually asking about, and a
-    metrics outage must not empty the table.
+    The whole window is returned rather than a page of it, which is what
+    makes the table honest: sorting and paging happen in the browser over
+    rows it actually holds, instead of claiming an order over pages it has
+    never seen. ``truncated`` says when that stopped being true.
     """
-    try:
-        rows = _grouped_token_rows(lf, days)
-    except UsageUnavailable:
-        logger.warning("token_attribution_unavailable")
-        return {}
-    return _counts_from(rows)
+    roots, roots_cut = _walk(lf, days, is_root_observation=True)
+    generations, gens_cut = _walk(lf, days, type="GENERATION")
 
+    # Money first, keyed by the trace it belongs to - the only field the two
+    # row types share.
+    cost_by_trace: dict[str, float] = {}
+    tokens_by_trace: dict[str, int] = {}
+    for gen in generations:
+        trace_id = str(getattr(gen, "trace_id", "") or "")
+        if not trace_id:
+            continue
+        cost_by_trace[trace_id] = cost_by_trace.get(trace_id, 0.0) + _as_float(
+            getattr(gen, "total_cost", None))
+        tokens_by_trace[trace_id] = tokens_by_trace.get(trace_id, 0) + _tokens_of(gen)
 
-def tokens_for_traces(
-    lf: Any, trace_ids: list[str], days: int = 30,
-) -> dict[str, int | None]:
-    """Tokens for each of the given traces: a count, or None if unknown.
+    accounts = {u["user_id"]: u for u in list_all_users()}
 
-    None and 0 are different answers and the table draws them differently.
-    A trace that spent nothing - a greeting, answered without a model call -
-    produces no observations and so is simply absent from the grouping, which
-    makes absence mean "free" as long as the grouping is complete. At the row
-    limit it was truncated instead, and calling that tail free would
-    understate the bill in the exact place an admin looks for overspend.
-    """
-    ids = [str(i) for i in trace_ids if i]
-    if not ids:
-        # An empty table must not spend one of the day's hundred requests to
-        # find out that it is empty.
-        return {}
-    try:
-        rows = _grouped_token_rows(lf, days)
-    except UsageUnavailable:
-        logger.warning("page_token_attribution_unavailable", traces=len(ids))
-        return {i: None for i in ids}
-
-    counts = _counts_from(rows)
-    truncated = len(rows) >= MAX_ROW_LIMIT
-    missing: int | None = None if truncated else 0
-    return {i: counts.get(i, missing) for i in ids}
-
-
-def per_user_usage(lf: Any, days: int = 30, limit: int = 50) -> list[dict[str, Any]]:
-    """Questions, tokens and spend for each user, dearest first.
-
-    Built from two sources because neither one can answer alone, and the
-    obvious single query is quietly wrong:
-
-    * Grouping observations by ``userId`` returns one row with everything in
-      it. The SDK does not carry a trace's user down to the generations
-      beneath it, so every observation has ``user_id=""`` and the whole bill
-      lands under "not tied to a user".
-    * Traces carry the user and the cost, but no token count at all.
-    * Observations carry the tokens, and the trace they belong to.
-
-    So spend and question counts are summed from the traces, and tokens are
-    attributed by joining the per-trace token totals onto them.
-    """
-    traces = _traces_in_window(lf, days)
-    tokens_by_trace = _tokens_by_trace(lf, days)
-
-    totals_by_user: dict[str, dict[str, Any]] = {}
-    for t in traces:
-        user_id = getattr(t, "user_id", "") or ""
-        bucket = totals_by_user.setdefault(
-            user_id, {"cost": 0.0, "tokens": 0, "traces": 0})
-        bucket["cost"] += _as_float(getattr(t, "total_cost", 0))
-        bucket["tokens"] += tokens_by_trace.get(str(getattr(t, "id", "")), 0)
-        bucket["traces"] += 1
-
-    names = {u["user_id"]: u for u in list_all_users()}
-    out: list[dict[str, Any]] = []
-    for user_id, bucket in totals_by_user.items():
-        account = names.get(user_id)
+    def name_of(user_id: str) -> tuple[str, str]:
+        account = accounts.get(user_id)
         if account:
-            username, role = account["username"], account.get("role", "user")
-        elif user_id:
+            return account["username"], account.get("role", "user")
+        if user_id:
             # The traces outlive the account. Hiding the row would quietly
             # remove its spend from what the admin is looking at.
-            username, role = f"{user_id[:8]} (deleted)", ""
-        else:
-            username, role = UNATTRIBUTED, ""
-        out.append({
+            return f"{user_id[:8]} (deleted)", ""
+        return UNATTRIBUTED, ""
+
+    traces: list[dict[str, Any]] = []
+    for r in roots:
+        trace_id = str(getattr(r, "trace_id", "") or "")
+        if not trace_id:
+            continue
+        user_id = str(getattr(r, "user_id", "") or "")
+        username, _role = name_of(user_id)
+        traces.append({
+            "id": trace_id,
+            "name": str(getattr(r, "trace_name", "") or getattr(r, "name", "") or ""),
+            "user_id": user_id,
+            "username": username,
+            "session_id": str(getattr(r, "session_id", "") or ""),
+            "input": str(getattr(r, "input", "") or ""),
+            "output": str(getattr(r, "output", "") or ""),
+            "tags": list(getattr(r, "tags", None) or []),
+            "created_at": str(getattr(r, "start_time", "") or ""),
+            "total_cost": round(cost_by_trace.get(trace_id, 0.0), 8),
+            "latency": _as_float(getattr(r, "latency", None)),
+            # 0, not None: a trace with no generation never reached a model,
+            # which small talk does not, and that really was free.
+            "tokens": tokens_by_trace.get(trace_id, 0),
+        })
+
+    # The join is by dictionary, so the order has to be restored explicitly.
+    traces.sort(key=lambda t: t["created_at"], reverse=True)
+
+    per_user: dict[str, dict[str, Any]] = {}
+    for t in traces:
+        bucket = per_user.setdefault(
+            t["user_id"], {"cost": 0.0, "tokens": 0, "traces": 0})
+        bucket["cost"] += t["total_cost"]
+        bucket["tokens"] += t["tokens"]
+        bucket["traces"] += 1
+
+    users = []
+    for user_id, bucket in per_user.items():
+        username, role = name_of(user_id)
+        users.append({
             "user_id": user_id,
             "username": username,
             "role": role,
@@ -259,30 +236,19 @@ def per_user_usage(lf: Any, days: int = 30, limit: int = 50) -> list[dict[str, A
             "tokens": bucket["tokens"],
             "cost": round(bucket["cost"], 8),
         })
+    users.sort(key=lambda u: u["cost"], reverse=True)
 
-    out.sort(key=lambda r: r["cost"], reverse=True)
-    return out[:max(1, limit)]
-
-
-def totals(lf: Any, days: int = 30) -> dict[str, Any]:
-    """Tokens and spend across the window, with no grouping."""
-    frm, to = _iso(_window(days))
-    rows = _run(lf, {
-        "view": "observations",
-        # No dimension: one row back, or none at all for an empty project.
-        "dimensions": [],
-        "metrics": [
-            {"measure": _TOKENS, "aggregation": "sum"},
-            {"measure": _COST, "aggregation": "sum"},
-        ],
-        "fromTimestamp": frm,
-        "toTimestamp": to,
-    })
-    if not rows:
-        return {"tokens": 0, "cost": 0.0}
+    # Totals span every generation read, including any whose root fell
+    # outside the walk - that spend is real and belongs in the bill even
+    # when the question behind it is not on the list.
     return {
-        "tokens": _as_int(rows[0].get(f"sum_{_TOKENS}")),
-        "cost": _as_float(rows[0].get(f"sum_{_COST}")),
+        "traces": traces,
+        "users": users[:max(1, user_limit)],
+        "totals": {
+            "cost": round(sum(cost_by_trace.values()), 8),
+            "tokens": sum(tokens_by_trace.values()),
+            "traces": len(traces),
+        },
+        "truncated": roots_cut or gens_cut,
+        "days": days,
     }
-
-
