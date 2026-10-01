@@ -16,6 +16,18 @@
 data/
 uploads/
 
+# ── Stray images ──────────────────────────────────────────────────────
+# Found in a built image: a 528 KB screenshot of the Oracle console, naming
+# the instance OCID, sat in /app because `COPY . .` takes anything not
+# excluded here. Nothing in the application reads an image from the repo
+# root, so none of them belong in a layer - and a console screenshot is the
+# kind of thing that should not be redistributable inside an image.
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+
 # ── Virtualenv ────────────────────────────────────────────────────────
 # The image builds its own venv with `uv sync` before this COPY runs.
 # Copying the host one over it lands a Windows/macOS pyvenv.cfg and
